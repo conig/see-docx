@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+"""Installed entry point for See DOCX."""
+
+from pathlib import Path
+import sys
+
+
+sys.dont_write_bytecode = True
+module_root = Path(__file__).resolve().parents[1] / "lib" / "see-docx"
+sys.path.insert(0, str(module_root))
+
+from see_docx.app import main  # noqa: E402
+
+
+raise SystemExit(main())

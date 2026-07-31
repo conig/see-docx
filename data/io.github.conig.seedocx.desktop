@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=See DOCX
+Comment=View DOCX documents without editing
+Exec=see-docx %f
+Terminal=false
+Categories=Office;Viewer;
+MimeType=application/vnd.openxmlformats-officedocument.wordprocessingml.document;
+Icon=x-office-document
+StartupNotify=true
