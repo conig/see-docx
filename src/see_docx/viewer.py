@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
+import json
+import os
 from collections.abc import Callable, Iterable
 from datetime import datetime
 from pathlib import Path
@@ -31,6 +34,25 @@ MAX_ZOOM = 2.00
 ZOOM_STEP = 0.10
 REFRESH_DEBOUNCE_MS = 450
 SCROLL_STEP = 56
+_THEME_STATE_SCHEMA_VERSION = 1
+_THEME_STATE_ROLES = frozenset(
+    {
+        "background_alt",
+        "canvas",
+        "surface",
+        "surface_raised",
+        "foreground",
+        "foreground_muted",
+        "metadata",
+        "gtk_command",
+        "highlight",
+        "dim",
+        "selection",
+        "selection_foreground",
+        "separator",
+    }
+)
+
 
 
 def _style(widget: Gtk.Widget, class_name: str) -> None:
@@ -46,8 +68,81 @@ def _lookup_color(widget: Gtk.Widget, name: str, fallback: str) -> str:
     return color.to_string() if found else fallback
 
 
+def _theme_state_path() -> Path:
+    """Return the documented SC1 Command UI state API location."""
+
+    state_home = os.environ.get("XDG_STATE_HOME")
+    if state_home:
+        return Path(state_home) / "sc1-command-ui" / "current.json"
+    return Path.home() / ".local" / "state" / "sc1-command-ui" / "current.json"
+
+
+def _is_hex_color(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 7
+        and value.startswith("#")
+        and all(character in "0123456789abcdefABCDEF" for character in value[1:])
+    )
+
+
+@lru_cache(maxsize=1)
+def _current_theme_state_roles() -> dict[str, str] | None:
+    """Read the complete SC1 palette snapshot, or decline it as unusable.
+
+    The state file is atomically published by SC1 Command UI. A complete
+    snapshot keeps this app from mixing a partially upgraded API with GTK
+    fallback values. GTK remains the compatibility path before first apply.
+    """
+
+    try:
+        document = json.loads(_theme_state_path().read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+
+    if (
+        not isinstance(document, dict)
+        or document.get("schema_version") != _THEME_STATE_SCHEMA_VERSION
+        or not isinstance(document.get("variant"), str)
+        or not isinstance(document.get("roles"), dict)
+    ):
+        return None
+
+    roles = document["roles"]
+    if not _THEME_STATE_ROLES.issubset(roles) or not all(
+        _is_hex_color(roles[role]) for role in _THEME_STATE_ROLES
+    ):
+        return None
+    return {role: roles[role] for role in _THEME_STATE_ROLES}
+
+
+def _theme_palette_from_state(roles: dict[str, str]) -> dict[str, str]:
+    """Map stable theme roles to See DOCX's visual vocabulary."""
+
+    return {
+        "background": roles["background_alt"],
+        "canvas": roles["canvas"],
+        "panel": roles["surface_raised"],
+        "panel_dark": roles["surface"],
+        "foreground": roles["foreground"],
+        "view_foreground": roles["gtk_command"],
+        "text": roles["metadata"],
+        "muted": roles["foreground_muted"],
+        "metadata": roles["metadata"],
+        "accent": roles["gtk_command"],
+        "highlight": roles["highlight"],
+        "accent_dim": roles["dim"],
+        "selected_background": roles["selection"],
+        "selected_foreground": roles["selection_foreground"],
+        "separator": roles["separator"],
+    }
+
+
 def _theme_palette(widget: Gtk.Widget) -> dict[str, str]:
-    """Resolve SC1 semantic colours, with useful standard GTK fallbacks."""
+    """Prefer the SC1 state API, then resolve semantic GTK fallbacks."""
+
+    if roles := _current_theme_state_roles():
+        return _theme_palette_from_state(roles)
 
     background = _lookup_color(widget, "theme_bg_color", "#202326")
     canvas = _lookup_color(widget, "theme_base_color", background)
