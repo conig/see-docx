@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
+from difflib import SequenceMatcher
 from functools import lru_cache
+from html import escape as html_escape
 import json
 import math
 import os
@@ -723,6 +727,349 @@ class TextSelection:
     bottom: float
 
 
+@dataclass(frozen=True)
+class RichTextClipboardPayload:
+    """The interoperable rich and plain representations of a selection."""
+
+    text: str
+    html: str
+
+
+@dataclass(frozen=True)
+class _DocxRun:
+    """One DOCX run, retaining the inline properties Writer needs on paste."""
+
+    text: str
+    tags: tuple[tuple[str, str], ...]
+
+    def html_for_range(self, start: int, end: int) -> str:
+        """Render the requested local character range with this run's style."""
+
+        text = self.text[max(start, 0) : max(end, 0)]
+        if not text:
+            return ""
+        rendered = html_escape(text, quote=False).replace("\n", "<br>")
+        for opening, closing in reversed(self.tags):
+            rendered = f"{opening}{rendered}{closing}"
+        return rendered
+
+
+@dataclass(frozen=True)
+class _DocxParagraph:
+    """A paragraph whose runs can be copied without losing inline style."""
+
+    runs: tuple[_DocxRun, ...]
+    opening_tag: str = "<p>"
+
+    @property
+    def text(self) -> str:
+        return "".join(run.text for run in self.runs)
+
+    def html_for_range(self, start: int, end: int) -> str:
+        """Render a local selection as one valid HTML paragraph."""
+
+        cursor = 0
+        content: list[str] = []
+        for run in self.runs:
+            run_end = cursor + len(run.text)
+            overlap_start = max(start, cursor)
+            overlap_end = min(end, run_end)
+            if overlap_start < overlap_end:
+                content.append(
+                    run.html_for_range(overlap_start - cursor, overlap_end - cursor)
+                )
+            cursor = run_end
+        return f"{self.opening_tag}{''.join(content)}</p>"
+
+
+@dataclass(frozen=True)
+class _DocxTableCell:
+    """A DOCX table cell, including its own rich paragraph content."""
+
+    paragraphs: tuple[_DocxParagraph, ...]
+    colspan: int = 1
+
+    @property
+    def text(self) -> str:
+        return "\n".join(paragraph.text for paragraph in self.paragraphs)
+
+    def html_for_range(self, start: int, end: int) -> str:
+        """Copy a cell as a one-cell table, matching Writer's table semantics."""
+
+        cursor = 0
+        paragraphs: list[str] = []
+        for paragraph in self.paragraphs:
+            paragraph_end = cursor + len(paragraph.text)
+            overlap_start = max(start, cursor)
+            overlap_end = min(end, paragraph_end)
+            if overlap_start < overlap_end:
+                paragraphs.append(
+                    paragraph.html_for_range(
+                        overlap_start - cursor, overlap_end - cursor
+                    )
+                )
+            cursor = paragraph_end + 1
+        colspan = f' colspan="{self.colspan}"' if self.colspan > 1 else ""
+        return f"<table><tbody><tr><td{colspan}>{''.join(paragraphs)}</td></tr></tbody></table>"
+
+    def full_html(self) -> str:
+        return self.html_for_range(0, len(self.text))
+
+
+@dataclass(frozen=True)
+class _DocxTable:
+    """A table in the DOCX body, retained for copy-all rich text."""
+
+    rows: tuple[tuple[_DocxTableCell, ...], ...]
+
+    @property
+    def selection_text(self) -> str:
+        """Return the glyph order emitted by Writer's PDF exporter."""
+
+        return "\n".join("".join(cell.text for cell in row) for row in self.rows)
+
+    @property
+    def plain_text(self) -> str:
+        return "\n".join("\t".join(cell.text for cell in row) for row in self.rows)
+
+    def full_html(self) -> str:
+        rows: list[str] = []
+        for row in self.rows:
+            cells = []
+            for cell in row:
+                colspan = f' colspan="{cell.colspan}"' if cell.colspan > 1 else ""
+                content = "".join(
+                    paragraph.html_for_range(0, len(paragraph.text))
+                    for paragraph in cell.paragraphs
+                )
+                cells.append(f"<td{colspan}>{content}</td>")
+            rows.append(f"<tr>{''.join(cells)}</tr>")
+        return f"<table><tbody>{''.join(rows)}</tbody></table>"
+
+
+@dataclass(frozen=True)
+class _DocxSelectionFragment:
+    """A selectable paragraph or cell positioned in PDF glyph order."""
+
+    start: int
+    end: int
+    content: _DocxParagraph | _DocxTableCell
+
+    @property
+    def text(self) -> str:
+        return self.content.text
+
+    def html_for_range(self, start: int, end: int) -> str:
+        return self.content.html_for_range(start, end)
+
+
+class _DocxRichTextSource:
+    """DOCX source structure used to restore rich selections from PDF glyphs."""
+
+    def __init__(
+        self,
+        blocks: tuple[_DocxParagraph | _DocxTable, ...],
+        fragments: tuple[_DocxSelectionFragment, ...],
+        selection_text: str,
+    ) -> None:
+        self._blocks = blocks
+        self._fragments = fragments
+        self._selection_text = selection_text
+
+    @property
+    def plain_text(self) -> str:
+        """Return the document text with table columns preserved by tabs."""
+
+        return "\n".join(
+            block.text if isinstance(block, _DocxParagraph) else block.plain_text
+            for block in self._blocks
+        )
+
+    def full_payload(self) -> RichTextClipboardPayload:
+        """Return a rich representation of the complete source document."""
+
+        content = "".join(
+            block.html_for_range(0, len(block.text))
+            if isinstance(block, _DocxParagraph)
+            else block.full_html()
+            for block in self._blocks
+        )
+        return RichTextClipboardPayload(
+            text=self.plain_text,
+            html=f"<html><body>{content}</body></html>",
+        )
+
+    def payload_for_range(
+        self, start: int, end: int
+    ) -> RichTextClipboardPayload | None:
+        """Render an unambiguous source range as rich clipboard data."""
+
+        start = max(start, 0)
+        end = min(max(end, start), len(self._selection_text))
+        if start == end:
+            return None
+        fragments = [
+            fragment
+            for fragment in self._fragments
+            if fragment.start < end and start < fragment.end
+        ]
+        if not fragments:
+            return None
+        content: list[str] = []
+        for fragment in fragments:
+            content.append(
+                fragment.html_for_range(
+                    max(start, fragment.start) - fragment.start,
+                    min(end, fragment.end) - fragment.start,
+                )
+            )
+        return RichTextClipboardPayload(
+            text=self._selection_text[start:end],
+            html=f"<html><body>{''.join(content)}</body></html>",
+        )
+
+    def payload_for_text(self, selected_text: str) -> RichTextClipboardPayload | None:
+        """Find one selected PDF string in the source, refusing ambiguity."""
+
+        selected, _selected_indices = _fold_selection_whitespace(selected_text)
+        source, source_indices = _fold_selection_whitespace(self._selection_text)
+        if not selected:
+            return None
+        start = source.find(selected)
+        if start < 0 or source.find(selected, start + 1) >= 0:
+            return None
+        end = start + len(selected) - 1
+        return self.payload_for_range(source_indices[start], source_indices[end] + 1)
+
+
+class _GtkTargetEntry(ctypes.Structure):
+    """The C structure used by GTK3's multi-target clipboard API."""
+
+    _fields_ = [
+        ("target", ctypes.c_char_p),
+        ("flags", ctypes.c_uint),
+        ("info", ctypes.c_uint),
+    ]
+
+
+_GtkClipboardGetFunc = ctypes.CFUNCTYPE(
+    None,
+    ctypes.c_void_p,
+    ctypes.c_void_p,
+    ctypes.c_uint,
+    ctypes.c_void_p,
+)
+_GtkClipboardClearFunc = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p)
+_RICH_CLIPBOARD_HTML_INFO = 1
+_RICH_CLIPBOARD_TEXT_INFO = 2
+_RICH_CLIPBOARD_TARGETS = (
+    (b"text/html", _RICH_CLIPBOARD_HTML_INFO),
+    (b"text/plain;charset=utf-8", _RICH_CLIPBOARD_TEXT_INFO),
+    (b"UTF8_STRING", _RICH_CLIPBOARD_TEXT_INFO),
+    (b"TEXT", _RICH_CLIPBOARD_TEXT_INFO),
+    (b"STRING", _RICH_CLIPBOARD_TEXT_INFO),
+)
+_native_gtk_clipboard: ctypes.CDLL | None = None
+_native_gtk_clipboard_loaded = False
+_native_clipboard_owners: dict[int, RichTextClipboardPayload] = {}
+
+
+def _native_gtk_clipboard_api() -> ctypes.CDLL | None:
+    """Load GTK3's callback clipboard API omitted from PyGObject bindings."""
+
+    global _native_gtk_clipboard, _native_gtk_clipboard_loaded
+    if _native_gtk_clipboard_loaded:
+        return _native_gtk_clipboard
+    _native_gtk_clipboard_loaded = True
+    try:
+        library = ctypes.CDLL(ctypes.util.find_library("gtk-3") or "libgtk-3.so.0")
+    except OSError:
+        return None
+    library.gtk_clipboard_set_with_data.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(_GtkTargetEntry),
+        ctypes.c_uint,
+        _GtkClipboardGetFunc,
+        _GtkClipboardClearFunc,
+        ctypes.c_void_p,
+    ]
+    library.gtk_clipboard_set_with_data.restype = ctypes.c_int
+    library.gtk_selection_data_get_target.argtypes = [ctypes.c_void_p]
+    library.gtk_selection_data_get_target.restype = ctypes.c_void_p
+    library.gtk_selection_data_set.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_ubyte),
+        ctypes.c_int,
+    ]
+    library.gtk_selection_data_set.restype = None
+    library.gtk_selection_data_set_text.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.c_int,
+    ]
+    library.gtk_selection_data_set_text.restype = None
+    _native_gtk_clipboard = library
+    return library
+
+
+@_GtkClipboardGetFunc
+def _on_native_clipboard_get(
+    clipboard: int, selection_data: int, info: int, _user_data: int
+) -> None:
+    """Answer a GTK clipboard request with the requested MIME representation."""
+
+    payload = _native_clipboard_owners.get(int(clipboard))
+    library = _native_gtk_clipboard
+    if payload is None or library is None:
+        return
+    if info == _RICH_CLIPBOARD_HTML_INFO:
+        data = payload.html.encode("utf-8")
+        buffer = (ctypes.c_ubyte * len(data)).from_buffer_copy(data)
+        target = library.gtk_selection_data_get_target(selection_data)
+        library.gtk_selection_data_set(selection_data, target, 8, buffer, len(data))
+        return
+    data = payload.text.encode("utf-8")
+    library.gtk_selection_data_set_text(selection_data, data, len(data))
+
+
+@_GtkClipboardClearFunc
+def _on_native_clipboard_clear(clipboard: int, _user_data: int) -> None:
+    """Release the Python payload after GTK no longer owns the selection."""
+
+    _native_clipboard_owners.pop(int(clipboard), None)
+
+
+def _publish_rich_clipboard(
+    clipboard: Gtk.Clipboard, payload: RichTextClipboardPayload
+) -> bool:
+    """Offer HTML and plain text through GTK3's native selection owner."""
+
+    library = _native_gtk_clipboard_api()
+    if library is None or not hasattr(clipboard, "__gpointer__"):
+        return False
+    entries = (_GtkTargetEntry * len(_RICH_CLIPBOARD_TARGETS))(
+        *(
+            _GtkTargetEntry(target, 0, info)
+            for target, info in _RICH_CLIPBOARD_TARGETS
+        )
+    )
+    address = hash(clipboard)
+    published = library.gtk_clipboard_set_with_data(
+        ctypes.c_void_p(address),
+        entries,
+        len(entries),
+        _on_native_clipboard_get,
+        _on_native_clipboard_clear,
+        None,
+    )
+    if not published:
+        return False
+    _native_clipboard_owners[address] = payload
+    return True
+
+
 def _reflow_pdf_selection_text(text: str) -> str:
     """Join PDF-rendered line wraps so pasted prose remains reflowable."""
 
@@ -773,31 +1120,221 @@ def _restore_docx_paragraph_boundaries(
     return source_text[source_indices[start] : source_indices[end] + 1]
 
 
-def _docx_plain_text(path: Path) -> str | None:
-    """Extract paragraph-preserving text from the stable DOCX source copy."""
+def _docx_property_enabled(element: ET.Element | None) -> bool:
+    """Return whether a WordprocessingML boolean property is enabled."""
+
+    if element is None:
+        return False
+    value = element.get(f"{_WORDPROCESSINGML}val", "true").lower()
+    return value not in {"0", "false", "off", "none"}
+
+
+def _docx_run_tags(run: ET.Element, href: str | None = None) -> tuple[tuple[str, str], ...]:
+    """Translate portable DOCX run properties into an HTML tag stack."""
+
+    properties = run.find(f"{_WORDPROCESSINGML}rPr")
+    style: list[str] = []
+    if properties is not None:
+        color = properties.find(f"{_WORDPROCESSINGML}color")
+        color_value = color.get(f"{_WORDPROCESSINGML}val") if color is not None else None
+        if color_value and len(color_value) == 6 and all(
+            character in "0123456789abcdefABCDEF" for character in color_value
+        ):
+            style.append(f"color: #{color_value}")
+        size = properties.find(f"{_WORDPROCESSINGML}sz")
+        size_value = size.get(f"{_WORDPROCESSINGML}val") if size is not None else None
+        if size_value and size_value.isdigit():
+            style.append(f"font-size: {int(size_value) / 2:g}pt")
+        fonts = properties.find(f"{_WORDPROCESSINGML}rFonts")
+        font_name = None
+        if fonts is not None:
+            font_name = fonts.get(f"{_WORDPROCESSINGML}ascii") or fonts.get(
+                f"{_WORDPROCESSINGML}hAnsi"
+            )
+        if font_name:
+            style.append(f"font-family: {html_escape(font_name, quote=True)}")
+
+    tags: list[tuple[str, str]] = []
+    if href:
+        tags.append((f'<a href="{html_escape(href, quote=True)}">', "</a>"))
+    if style:
+        tags.append((f'<span style="{"; ".join(style)}">', "</span>"))
+    if _docx_property_enabled(
+        properties.find(f"{_WORDPROCESSINGML}b") if properties is not None else None
+    ):
+        tags.append(("<strong>", "</strong>"))
+    if _docx_property_enabled(
+        properties.find(f"{_WORDPROCESSINGML}i") if properties is not None else None
+    ):
+        tags.append(("<em>", "</em>"))
+    underline = properties.find(f"{_WORDPROCESSINGML}u") if properties is not None else None
+    if _docx_property_enabled(underline):
+        tags.append(("<u>", "</u>"))
+    if _docx_property_enabled(
+        properties.find(f"{_WORDPROCESSINGML}strike") if properties is not None else None
+    ):
+        tags.append(("<s>", "</s>"))
+    vertical = (
+        properties.find(f"{_WORDPROCESSINGML}vertAlign")
+        if properties is not None
+        else None
+    )
+    if vertical is not None:
+        value = vertical.get(f"{_WORDPROCESSINGML}val")
+        if value == "superscript":
+            tags.append(("<sup>", "</sup>"))
+        elif value == "subscript":
+            tags.append(("<sub>", "</sub>"))
+    return tuple(tags)
+
+
+def _docx_run(run: ET.Element, href: str | None = None) -> _DocxRun | None:
+    """Extract one visible Word run and the formatting used to render it."""
+
+    text: list[str] = []
+    for element in run:
+        if element.tag == f"{_WORDPROCESSINGML}t":
+            text.append(element.text or "")
+        elif element.tag == f"{_WORDPROCESSINGML}tab":
+            text.append("\t")
+        elif element.tag in {
+            f"{_WORDPROCESSINGML}br",
+            f"{_WORDPROCESSINGML}cr",
+        }:
+            text.append("\n")
+        elif element.tag == f"{_WORDPROCESSINGML}noBreakHyphen":
+            text.append("‑")
+    content = "".join(text)
+    return _DocxRun(content, _docx_run_tags(run, href)) if content else None
+
+
+def _docx_paragraph(
+    element: ET.Element, relationships: dict[str, str]
+) -> _DocxParagraph:
+    """Parse a paragraph's visible runs while retaining their inline style."""
+
+    properties = element.find(f"{_WORDPROCESSINGML}pPr")
+    opening_tag = "<p>"
+    if properties is not None:
+        alignment = properties.find(f"{_WORDPROCESSINGML}jc")
+        value = alignment.get(f"{_WORDPROCESSINGML}val") if alignment is not None else None
+        alignments = {"left", "center", "right", "both", "justify"}
+        if value in alignments:
+            css_value = "justify" if value == "both" else value
+            opening_tag = f'<p style="text-align: {css_value}">'
+
+    runs: list[_DocxRun] = []
+    for child in element:
+        if child.tag == f"{_WORDPROCESSINGML}r":
+            run = _docx_run(child)
+            if run is not None:
+                runs.append(run)
+        elif child.tag == f"{_WORDPROCESSINGML}hyperlink":
+            relationship_id = child.get(f"{_WORDPROCESSINGML}id")
+            href = relationships.get(relationship_id or "")
+            for run_element in child.findall(f"{_WORDPROCESSINGML}r"):
+                run = _docx_run(run_element, href)
+                if run is not None:
+                    runs.append(run)
+    return _DocxParagraph(tuple(runs), opening_tag)
+
+
+def _docx_table(
+    element: ET.Element, relationships: dict[str, str]
+) -> _DocxTable:
+    """Parse the table grid needed for table-aware copy and paste."""
+
+    rows: list[tuple[_DocxTableCell, ...]] = []
+    for row_element in element.findall(f"{_WORDPROCESSINGML}tr"):
+        cells: list[_DocxTableCell] = []
+        for cell_element in row_element.findall(f"{_WORDPROCESSINGML}tc"):
+            paragraphs = tuple(
+                _docx_paragraph(paragraph, relationships)
+                for paragraph in cell_element.findall(f"{_WORDPROCESSINGML}p")
+            )
+            cell_properties = cell_element.find(f"{_WORDPROCESSINGML}tcPr")
+            grid_span = (
+                cell_properties.find(f"{_WORDPROCESSINGML}gridSpan")
+                if cell_properties is not None
+                else None
+            )
+            span_value = grid_span.get(f"{_WORDPROCESSINGML}val") if grid_span is not None else None
+            colspan = int(span_value) if span_value and span_value.isdigit() else 1
+            cells.append(_DocxTableCell(paragraphs, colspan))
+        rows.append(tuple(cells))
+    return _DocxTable(tuple(rows))
+
+
+def _docx_relationships(archive: zipfile.ZipFile) -> dict[str, str]:
+    """Return external hyperlink targets keyed by the document relationship ID."""
+
+    try:
+        relationships = ET.fromstring(archive.read("word/_rels/document.xml.rels"))
+    except (ET.ParseError, KeyError):
+        return {}
+    result: dict[str, str] = {}
+    for relationship in relationships:
+        if relationship.get("TargetMode") != "External":
+            continue
+        identifier = relationship.get("Id")
+        target = relationship.get("Target")
+        if identifier and target:
+            result[identifier] = target
+    return result
+
+
+def _docx_rich_text_source(path: Path) -> _DocxRichTextSource | None:
+    """Parse enough OOXML structure to restore rich clipboard selections."""
 
     try:
         with zipfile.ZipFile(path) as archive:
             document = ET.fromstring(archive.read("word/document.xml"))
+            relationships = _docx_relationships(archive)
     except (ET.ParseError, KeyError, OSError, zipfile.BadZipFile):
         return None
 
-    paragraphs: list[str] = []
-    for paragraph in document.iter(f"{_WORDPROCESSINGML}p"):
-        text: list[str] = []
-        for element in paragraph.iter():
-            if element.tag == f"{_WORDPROCESSINGML}t":
-                text.append(element.text or "")
-            elif element.tag == f"{_WORDPROCESSINGML}tab":
-                text.append("\t")
-            elif element.tag in {
-                f"{_WORDPROCESSINGML}br",
-                f"{_WORDPROCESSINGML}cr",
-            }:
-                text.append("\n")
-        if text:
-            paragraphs.append("".join(text))
-    return "\n".join(paragraphs)
+    body = document.find(f"{_WORDPROCESSINGML}body")
+    if body is None:
+        return None
+    blocks: list[_DocxParagraph | _DocxTable] = []
+    fragments: list[_DocxSelectionFragment] = []
+    selection_parts: list[str] = []
+    cursor = 0
+
+    def append(text: str) -> tuple[int, int]:
+        nonlocal cursor
+        start = cursor
+        selection_parts.append(text)
+        cursor += len(text)
+        return start, cursor
+
+    for element in body:
+        if element.tag == f"{_WORDPROCESSINGML}p":
+            paragraph = _docx_paragraph(element, relationships)
+            blocks.append(paragraph)
+            start, end = append(paragraph.text)
+            if start != end:
+                fragments.append(_DocxSelectionFragment(start, end, paragraph))
+            append("\n")
+        elif element.tag == f"{_WORDPROCESSINGML}tbl":
+            table = _docx_table(element, relationships)
+            blocks.append(table)
+            for row in table.rows:
+                for cell in row:
+                    start, end = append(cell.text)
+                    if start != end:
+                        fragments.append(_DocxSelectionFragment(start, end, cell))
+                append("\n")
+    if not blocks:
+        return None
+    return _DocxRichTextSource(tuple(blocks), tuple(fragments), "".join(selection_parts))
+
+
+def _docx_plain_text(path: Path) -> str | None:
+    """Extract paragraph-preserving text from the stable DOCX source copy."""
+
+    source = _docx_rich_text_source(path)
+    return source.plain_text if source is not None else None
 
 
 def _text_selection_bounds(
@@ -1181,13 +1718,53 @@ class PdfPage(Gtk.DrawingArea):
             )
         return _reflow_pdf_selection_text(text)
 
-    def _copy_selection(self, text: str) -> None:
-        """Publish pointer-selected text for both Ctrl+V and primary paste."""
+    def selected_source_range(
+        self, selection: TextSelection
+    ) -> tuple[int, int] | None:
+        """Return the OOXML source range represented by this glyph selection."""
+
+        mapping = getattr(self, "_source_character_map", None)
+        start = getattr(self, "_text_selection_start", None)
+        end = getattr(self, "_text_selection_end", None)
+        if not mapping or start is None or end is None:
+            return None
+        try:
+            text = self._page.get_text()
+            has_layout, rectangles = self._page.get_text_layout()
+        except (AttributeError, TypeError, ValueError):
+            return None
+        if not has_layout or len(text) != len(rectangles):
+            return None
+        first = self._nearest_glyph_index(text, rectangles, start)
+        last = self._nearest_glyph_index(text, rectangles, end)
+        if first is None or last is None:
+            return None
+        source_indices = [
+            mapping[index]
+            for index in range(min(first, last), max(first, last) + 1)
+            if index in mapping and text[index] not in "\r\n"
+        ]
+        if not source_indices:
+            return None
+        return min(source_indices), max(source_indices) + 1
+
+    def _copy_selection(self, text: str, html: str | None = None) -> None:
+        """Publish a selection for both Ctrl+V and primary paste.
+
+        HTML is offered alongside text/plain so Writer receives formatted
+        runs and table cells, while terminals and plain editors keep their
+        expected UTF-8 fallback.
+        """
 
         if not text:
             return
         for atom in (Gdk.SELECTION_CLIPBOARD, Gdk.SELECTION_PRIMARY):
-            Gtk.Clipboard.get(atom).set_text(text, -1)
+            clipboard = Gtk.Clipboard.get(atom)
+            if html and _publish_rich_clipboard(
+                clipboard, RichTextClipboardPayload(text, html)
+            ):
+                continue
+            clipboard.set_text(text, -1)
 
     def set_text_selection(
         self,
@@ -1438,6 +2015,7 @@ class PdfDocumentView:
         self.widget.add(self._pages_box)
         self._pages: list[PdfPage] = []
         self._document: Poppler.Document | None = None
+        self._rich_source: _DocxRichTextSource | None = None
         self._source_text: str | None = None
         self._outline: list[OutlineEntry] = []
         self._outline_locator_source = 0
@@ -1692,6 +2270,49 @@ class PdfDocumentView:
             )
         return regions
 
+    def _map_pdf_glyphs_to_source(self) -> None:
+        """Map rendered PDF glyph positions back to their OOXML characters."""
+
+        source = self._rich_source
+        if source is None:
+            return
+        page_text: list[str] = []
+        offsets: list[int] = []
+        cursor = 0
+        for index, page in enumerate(self._pages):
+            try:
+                text = page._page.get_text()
+            except (AttributeError, TypeError, ValueError):
+                text = ""
+            page._source_character_map = {}
+            offsets.append(cursor)
+            page_text.append(text)
+            cursor += len(text)
+            if index + 1 < len(self._pages):
+                # A page boundary is always at least a visual text boundary.
+                # Folding it to whitespace keeps wrapped paragraphs aligned.
+                cursor += 1
+        rendered_text = "\n".join(page_text)
+        rendered, rendered_indices = _fold_selection_whitespace(rendered_text)
+        source_text, source_indices = _fold_selection_whitespace(source._selection_text)
+        if not rendered or not source_text:
+            return
+        matcher = SequenceMatcher(None, rendered, source_text)
+        for match in matcher.get_matching_blocks():
+            for delta in range(match.size):
+                rendered_index = rendered_indices[match.a + delta]
+                page_index = 0
+                while (
+                    page_index + 1 < len(offsets)
+                    and rendered_index >= offsets[page_index + 1]
+                ):
+                    page_index += 1
+                local_index = rendered_index - offsets[page_index]
+                if 0 <= local_index < len(page_text[page_index]):
+                    self._pages[page_index]._source_character_map[local_index] = (
+                        source_indices[match.b + delta]
+                    )
+
     def _apply_document_selection(self) -> None:
         """Render and copy every page segment covered by the active drag."""
 
@@ -1704,19 +2325,36 @@ class PdfDocumentView:
                 page.clear_text_selection()
 
         text: list[str] = []
+        source_ranges: list[tuple[int, int]] = []
         for page, selection, start, end in regions:
             page.set_text_selection(selection, start=start, end=end)
             selected = page.selected_text(selection)
-            source_text = getattr(self, "_source_text", None)
-            if source_text is not None:
-                selected = (
-                    _restore_docx_paragraph_boundaries(source_text, selected)
-                    or selected
-                )
             if selected:
                 text.append(selected)
+            source_range = page.selected_source_range(selection)
+            if source_range is not None:
+                source_ranges.append(source_range)
         if text and self._selection_anchor_page is not None:
-            self._selection_anchor_page._copy_selection("\n".join(text))
+            selected_text = "\n".join(text)
+            source = getattr(self, "_rich_source", None)
+            payload = None
+            if source is not None and source_ranges:
+                payload = source.payload_for_range(
+                    min(start for start, _end in source_ranges),
+                    max(end for _start, end in source_ranges),
+                )
+            if payload is None and source is not None:
+                payload = source.payload_for_text(selected_text)
+            if payload is not None:
+                self._selection_anchor_page._copy_selection(payload.text, payload.html)
+                return
+            source_text = getattr(self, "_source_text", None)
+            if source_text is not None:
+                selected_text = (
+                    _restore_docx_paragraph_boundaries(source_text, selected_text)
+                    or selected_text
+                )
+            self._selection_anchor_page._copy_selection(selected_text)
 
     def _update_selection_auto_scroll(
         self, page: PdfPage, point: tuple[float, float]
@@ -1777,7 +2415,11 @@ class PdfDocumentView:
             self._on_page_changed(self.current_page_index, self.page_count)
 
     def set_document(
-        self, document: Poppler.Document, *, source_text: str | None = None
+        self,
+        document: Poppler.Document,
+        *,
+        source: _DocxRichTextSource | None = None,
+        source_text: str | None = None,
     ) -> None:
         self._clear_outline_locator()
         self.clear_search_highlight()
@@ -1786,7 +2428,8 @@ class PdfDocumentView:
             self._pages_box.remove(page)
         self._pages.clear()
         self._document = document
-        self._source_text = source_text
+        self._rich_source = source
+        self._source_text = source.plain_text if source is not None else source_text
         self._outline = _document_outline(document)
         for number in range(document.get_n_pages()):
             page = PdfPage(
@@ -1797,6 +2440,7 @@ class PdfDocumentView:
             )
             self._pages_box.pack_start(page, False, False, 0)
             self._pages.append(page)
+        self._map_pdf_glyphs_to_source()
         self._pages_box.show_all()
         self._notify_page_changed()
 
@@ -2027,8 +2671,14 @@ class PdfDocumentView:
             self._search_highlight_page = None
 
     def copy_all_text(self) -> bool:
-        """Copy the document text without turning every page into a highlight."""
+        """Copy the document without turning every page into a highlight."""
 
+        source = getattr(self, "_rich_source", None)
+        if source is not None and self._pages:
+            payload = source.full_payload()
+            if payload.text:
+                self._pages[0]._copy_selection(payload.text, payload.html)
+                return True
         text = self._source_text
         if text is None:
             page_text: list[str] = []
@@ -3329,7 +3979,7 @@ class DocxWindow(Gtk.ApplicationWindow):
             self._set_status(f"Preview PDF could not be opened: {error.message}")
             return
         self.document.set_document(
-            document, source_text=_docx_plain_text(paths.source_copy)
+            document, source=_docx_rich_text_source(paths.source_copy)
         )
         self._update_outline()
         if self._search_panel.get_visible():

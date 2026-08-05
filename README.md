@@ -60,10 +60,10 @@ see-docx path/to/output.docx
 | `Tab`, then `j` / `k` / `Ctrl+d` / `Ctrl+u` / `h` / `l` / `Enter` | Open the heading outline; select, half-page jump, collapse/expand, or jump to a heading |
 | `/`, then `Enter` / `Shift+Enter` / `Esc` | Search document text; commit forward/backward search, or cancel it completely with `Esc` |
 | `n` / `N` | Next / previous result while a committed search remains active |
-| `a` | Copy all document text to the clipboard |
+| `a` | Copy the complete document, preserving rich text and tables |
 | `y` | Copy the resolved local DOCX path to the clipboard |
 | `e`, then `j` / `k` / `Enter` | Open the export tool, choose PDF or plain text, then select its destination |
-| Drag across PDF text | Highlight the selected glyphs and copy them immediately to the regular and primary clipboards |
+| Drag across PDF text | Highlight selected glyphs and copy formatted text or table cells immediately to the regular and primary clipboards |
 | `f`, then a displayed home-row hint | Open a visible URL with its default desktop application |
 | `:number` | Jump directly to one-based page `number` |
 | `+` / `-` / `0` | Zoom in / out / reset zoom |
@@ -99,8 +99,11 @@ move through matches, using the current SC1GTK variant's accent and highlight
 colours. Pressing `Esc` cancels that search session: it clears the highlight and
 result list, so `n` / `N` no longer navigate until a new search.
 Pointer text selections continue across page breaks and copy all intersected
-pages as one clipboard value. Keep holding the mouse button to use the wheel,
-or drag above or below a page to auto-scroll while extending the selection.
+pages as one clipboard value. The DOCX source restores formatting and table
+structure for Writer-compatible HTML paste, while plain text remains available
+for other applications; a selected table cell is copied as a cell rather than
+its visual PDF row. Keep holding the mouse button to use the wheel, or drag
+above or below a page to auto-scroll while extending the selection.
 Press `e` to open the export tool. Choose PDF or plain text with `j` / `k` and
 `Enter`, then select a destination in the save dialog. PDF uses an isolated
 LibreOffice profile; plain text is exported by Pandoc. Both replace the final
