@@ -14,8 +14,9 @@ build command.
 - Opens one `.docx` document from the command line or desktop association.
 - Renders through LibreOffice, preserving Word page layout more faithfully
   than browser-based DOCX-to-HTML renderers.
-- Displays the PDF pages in a native GTK/Poppler window, floating above a
-  contrasting canvas with clear page edges; no editing controls are present.
+- Displays each PDF page as a separate A4 sheet in a vertically scrollable
+  native GTK/Poppler print-preview workspace, floating above a contrasting
+  canvas with clear page edges; no editing controls are present.
 - Watches the output directory and handles atomic file replacement, which is
   how Markdown renderers commonly write a regenerated DOCX.
 - Debounces source events for 450 ms and never displays an older conversion
@@ -51,16 +52,59 @@ see-docx path/to/output.docx
 | Keys | Action |
 | --- | --- |
 | `j` / `k` | Scroll down / up |
-| `Ctrl+d` / `Ctrl+u` | Scroll down / up half a page |
+| `J` / `K` | Next / previous document page |
+| `Ctrl+d` / `Ctrl+u` | Scroll the document—or move through the open outline—down / up half a page |
+| `Ctrl` + mouse wheel | Zoom in / out at the current reading position |
 | `Page Down` / `Page Up` | Next / previous document page |
 | `gg` / `G` | Jump to the top / bottom |
+| `Tab`, then `j` / `k` / `Ctrl+d` / `Ctrl+u` / `h` / `l` / `Enter` | Open the heading outline; select, half-page jump, collapse/expand, or jump to a heading |
+| `/`, then `Enter` / `Shift+Enter` / `Esc` | Search document text; commit forward/backward search, or cancel it completely with `Esc` |
+| `n` / `N` | Next / previous result while a committed search remains active |
+| `a` | Copy all document text to the clipboard |
+| `y` | Copy the resolved local DOCX path to the clipboard |
+| `e`, then `j` / `k` / `Enter` | Open the export tool, choose PDF or plain text, then select its destination |
+| Drag across PDF text | Highlight the selected glyphs and copy them immediately to the regular and primary clipboards |
+| `f`, then a displayed home-row hint | Open a visible URL with its default desktop application |
+| `:number` | Jump directly to one-based page `number` |
 | `+` / `-` / `0` | Zoom in / out / reset zoom |
 | `r` | Refresh now |
 | `q` | Close See DOCX |
 
-The toolbar shows the current page and total pages, with previous/next controls
-for direct page navigation. The complete document remains scrollable, with
-every page visible as a separate sheet above the same background.
+The bottom bar shows the resolved document path and current page/total. The
+complete document remains scrollable, with every page visible as a separate
+sheet above the same background; use the keyboard shortcuts above for page
+navigation, zoom, outline navigation, and refresh. The outline comes from
+headings exported in the DOCX/PDF; use Word heading styles when a document has
+no visible outline.
+It initially expands only as many whole heading levels as will keep the visible
+list below 10 entries; use `l` to reveal deeper structure.
+Its relative `j` / `k` offsets use a fixed gutter, like Neovim relative line
+numbers. The outline uses one shared spacing unit for its left inset, three-unit
+offset gutter, tree indentation, and gaps around expanders, so an offset never
+sits between an arrow and its heading.
+Expanded or hovered outline arrows use the active SC1GTK variant highlight.
+Opening the outline reserves a left column and temporarily fits the complete
+page into the remaining viewport; closing it restores the previous zoom.
+Selecting a heading places it in reading context and briefly marks its exact
+location on the PDF page.
+The search prompt appears centered over the document page as one command bar:
+`/` marks the mode, the query fills the bar, and `current of total` appears at
+the end. After `Enter`, that state becomes a smaller bottom-centre readout,
+showing `Search · current of total` until `Esc`, while the page count remains
+at the lower right. The
+reading-progress rule shows muted ticks for all matches and an accent tick for
+the active result; its fill uses the same navigation position as that active
+tick. The active text-search result remains highlighted in the PDF while you
+move through matches, using the current SC1GTK variant's accent and highlight
+colours. Pressing `Esc` cancels that search session: it clears the highlight and
+result list, so `n` / `N` no longer navigate until a new search.
+Pointer text selections continue across page breaks and copy all intersected
+pages as one clipboard value. Keep holding the mouse button to use the wheel,
+or drag above or below a page to auto-scroll while extending the selection.
+Press `e` to open the export tool. Choose PDF or plain text with `j` / `k` and
+`Enter`, then select a destination in the save dialog. PDF uses an isolated
+LibreOffice profile; plain text is exported by Pandoc. Both replace the final
+file only after a successful conversion.
 
 ## Dependencies
 
@@ -72,9 +116,11 @@ python
 python-gobject
 poppler
 libreoffice-fresh
+pandoc
 ```
 
-The installed application uses `soffice`, which is provided by LibreOffice.
+The installed application uses `soffice`, which is provided by LibreOffice, and
+`pandoc` for plain-text export.
 
 ## Install
 
@@ -104,8 +150,8 @@ make check
 
 The tests cover the position-restoration policy, including unchanged
 pagination, pagination reflow, removed pages, and scroll-range clamping. The
-conversion command test confirms each preview uses an isolated LibreOffice
-profile and Writer's PDF export filter.
+conversion command tests confirm each preview uses an isolated LibreOffice
+profile and Writer's PDF export filter, and that plain-text export uses Pandoc.
 
 With a desktop display available, run the live-refresh smoke test too:
 

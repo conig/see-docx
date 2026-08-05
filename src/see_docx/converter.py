@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -20,6 +21,42 @@ class ConversionPaths:
     profile: Path
     output_dir: Path
     pdf: Path
+
+
+@dataclass(frozen=True)
+class PandocConversionPaths:
+    """Private working paths for one Pandoc plain-text export."""
+
+    root: Path
+    source_copy: Path
+    text: Path
+
+
+def _copy_stable_source(source: Path, destination: Path) -> None:
+    """Copy *source* only when it remains unchanged during the copy."""
+
+    before = source.stat()
+    shutil.copy2(source, destination)
+    after = source.stat()
+    if (before.st_mtime_ns, before.st_size) != (after.st_mtime_ns, after.st_size):
+        raise ConversionError("The source changed while the export was being prepared.")
+
+
+def _save_output(source: Path, destination: Path, *, suffix: str) -> Path:
+    """Atomically copy a completed export to its requested destination."""
+
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.stem}-", suffix=suffix, dir=destination.parent
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        shutil.copy2(source, temporary)
+        temporary.replace(destination)
+    except OSError:
+        temporary.unlink(missing_ok=True)
+        raise
+    return destination
 
 
 class LibreOfficeConverter:
@@ -89,11 +126,7 @@ class LibreOfficeConverter:
 
         paths = self.paths_for(revision)
         paths.output_dir.mkdir(parents=True)
-        before = source.stat()
-        shutil.copy2(source, paths.source_copy)
-        after = source.stat()
-        if (before.st_mtime_ns, before.st_size) != (after.st_mtime_ns, after.st_size):
-            raise ConversionError("The source changed while the preview was being prepared.")
+        _copy_stable_source(source, paths.source_copy)
         return paths
 
     @staticmethod
@@ -110,6 +143,17 @@ class LibreOfficeConverter:
             raise ConversionError(f"LibreOffice could not render this DOCX.{suffix}")
         return paths.pdf
 
+    @staticmethod
+    def save_pdf(pdf: Path, destination: Path) -> Path:
+        """Atomically publish a rendered PDF at the requested destination.
+
+        The preview conversion itself happens in a private temporary directory.
+        Copy through a sibling temporary file so a failed or interrupted export
+        never leaves a partially written PDF at the user-selected path.
+        """
+
+        return _save_output(pdf, destination, suffix=".pdf")
+
     def discard_before(self, revision: int) -> None:
         """Keep only the current and later preview work directories."""
 
@@ -120,6 +164,63 @@ class LibreOfficeConverter:
                 continue
             if number < revision:
                 shutil.rmtree(directory, ignore_errors=True)
+
+    def close(self) -> None:
+        shutil.rmtree(self._root, ignore_errors=True)
+
+
+class PandocConverter:
+    """Export a stable DOCX snapshot as plain text through Pandoc."""
+
+    def __init__(self) -> None:
+        self._root = Path(tempfile.mkdtemp(prefix="see-docx-pandoc-"))
+
+    def paths_for(self, revision: int) -> PandocConversionPaths:
+        root = self._root / f"export-{revision:06d}"
+        return PandocConversionPaths(
+            root=root,
+            source_copy=root / "source.docx",
+            text=root / "source.txt",
+        )
+
+    @staticmethod
+    def command(paths: PandocConversionPaths) -> list[str]:
+        return [
+            "pandoc",
+            "--from=docx",
+            "--to=plain",
+            "--output",
+            str(paths.text),
+            str(paths.source_copy),
+        ]
+
+    def prepare(self, source: Path, revision: int) -> PandocConversionPaths:
+        """Copy a stable DOCX snapshot and return its Pandoc working paths."""
+
+        paths = self.paths_for(revision)
+        paths.root.mkdir(parents=True)
+        _copy_stable_source(source, paths.source_copy)
+        return paths
+
+    @staticmethod
+    def validate(
+        paths: PandocConversionPaths,
+        *,
+        returncode: int,
+        stdout: str | None = None,
+        stderr: str | None = None,
+    ) -> Path:
+        if returncode != 0 or not paths.text.is_file():
+            details = (stderr or stdout or "").strip()
+            suffix = f"\n{details}" if details else ""
+            raise ConversionError(f"Pandoc could not export this DOCX as plain text.{suffix}")
+        return paths.text
+
+    @staticmethod
+    def save_text(text: Path, destination: Path) -> Path:
+        """Atomically publish a completed plain-text export."""
+
+        return _save_output(text, destination, suffix=".txt")
 
     def close(self) -> None:
         shutil.rmtree(self._root, ignore_errors=True)
