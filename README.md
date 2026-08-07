@@ -58,6 +58,9 @@ see-docx path/to/output.docx
 | `Page Down` / `Page Up` | Next / previous document page |
 | `gg` / `G` | Jump to the top / bottom |
 | `Tab`, then `j` / `k` / `Ctrl+d` / `Ctrl+u` / `h` / `l` / `Enter` | Open the heading outline; select, half-page jump, collapse/expand, or jump to a heading |
+| `c` | Focus the comment rail without changing the selected comment |
+| `v` | Toggle the right-side DOCX comment rail (shown by default) |
+| `W` | Open the source DOCX in LibreOffice Writer and close See DOCX; on Hyprland, keep its current workspace |
 | `/`, then `Enter` / `Shift+Enter` / `Esc` | Search document text; commit forward/backward search, or cancel it completely with `Esc` |
 | `n` / `N` | Next / previous result while a committed search remains active |
 | `a` | Copy the complete document, preserving rich text and tables |
@@ -87,6 +90,27 @@ Opening the outline reserves a left column and temporarily fits the complete
 page into the remaining viewport; closing it restores the previous zoom.
 Selecting a heading places it in reading context and briefly marks its exact
 location on the PDF page.
+DOCX comments appear in a responsive right-side rail by default. The rail
+groups Word comment replies into one anchored thread, showing a root message
+followed by indented replies in a single scrollable conversation. Its summary
+distinguishes threads from total messages. Each thread shows the author,
+messages, and a short quote of the root's attached source text; the quote is
+marked on the rendered page and the active thread is connected to its bubble
+with an accent line. Press `c` to focus the rail without changing the selected
+thread. In the thread list, `j` / `k` select the next / previous thread and
+stop at the ends; `gg` and `G` jump to the first / last thread. `Ctrl+d` /
+`Ctrl+u` scroll the full list by half a viewport. Press `Enter` on the selected
+thread to focus its conversation body; `j` / `k` scroll it line by line and
+`Ctrl+d` / `Ctrl+u` scroll it by half a viewport. `Esc` returns from the body to
+the list, then from the list to the document. The focused rail marks `COMMENTS`
+with the active SC1GTK highlight,
+and body focus adds a ring to the active thread. Threads share the rail's
+right edge; the selected thread widens toward the document instantly, while
+leaving the list unfocused clears its active sizing and connector. Press `v`
+to slide the rail away when you want a wider reading canvas.
+Comment-linked text uses a dimmed variant accent as context and switches to a
+high-contrast accent wash and underline only for the focused comment; the
+variant highlight role remains reserved for the dark comment rail surfaces.
 The search prompt appears centered over the document page as one command bar:
 `/` marks the mode, the query fills the bar, and `current of total` appears at
 the end. After `Enter`, that state becomes a smaller bottom-centre readout,

@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from see_docx.viewer import (
+    COMMENTS_HEADER_HEIGHT,
     OUTLINE_NAV_SPACING,
     _app_css,
     _reading_progress_fraction,
@@ -139,6 +140,29 @@ class ViewerStyleTests(unittest.TestCase):
             "  background-color: transparent;\n"
             "  border: 0;\n"
             "  box-shadow: none;\n",
+            css,
+        )
+
+    def test_comment_header_uses_compact_hierarchy_and_subtle_key_hints(self) -> None:
+        css = self._fallback_css()
+
+        self.assertIn(
+            ".see-docx-comments-header {\n"
+            f"  min-height: {COMMENTS_HEADER_HEIGHT}px;\n"
+            "  padding: 7px 12px 6px;\n"
+            "}",
+            css,
+        )
+        self.assertIn(
+            ".see-docx-comments-header-top {\n"
+            "  min-height: 17px;\n"
+            "}",
+            css,
+        )
+        self.assertIn(
+            ".see-docx-comments-key {\n"
+            "  color: #a9b2bd;\n"
+            "  font-size: 0.68em;\n",
             css,
         )
 
