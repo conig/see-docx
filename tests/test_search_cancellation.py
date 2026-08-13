@@ -78,9 +78,15 @@ class _SearchWindow:
         self.path = Path("/tmp/report.docx")
         self.document = _Document()
         self._pending_g = False
+        self.notifications: list[tuple[str, str, bool]] = []
 
     def _move_search_match(self, _direction: int) -> bool:
         return bool(self._search_matches)
+
+    def _show_notification(
+        self, title: str, detail: str = "", *, success: bool = True
+    ) -> None:
+        self.notifications.append((title, detail, success))
 
 
 class SearchCancellationTests(unittest.TestCase):
@@ -94,6 +100,16 @@ class SearchCancellationTests(unittest.TestCase):
         )
 
         self.assertTrue(window.document.copy_all_requested)
+        self.assertEqual(
+            window.notifications,
+            [
+                (
+                    "Document text copied",
+                    "The full document is ready to paste",
+                    True,
+                )
+            ],
+        )
 
     def test_y_copies_the_resolved_local_document_path(self) -> None:
         window = _SearchWindow()
@@ -107,6 +123,27 @@ class SearchCancellationTests(unittest.TestCase):
             )
 
         clipboard.set_text.assert_called_once_with("/tmp/report.docx", -1)
+        self.assertEqual(
+            window.notifications,
+            [("Path copied", "/tmp/report.docx", True)],
+        )
+
+    def test_copy_all_warns_when_document_text_is_not_ready(self) -> None:
+        window = _SearchWindow()
+        window.document.copy_all_text = lambda: False
+
+        window._copy_all_text()
+
+        self.assertEqual(
+            window.notifications,
+            [
+                (
+                    "Nothing to copy",
+                    "Document text is not available yet",
+                    False,
+                )
+            ],
+        )
 
     def test_escape_clears_a_committed_search_and_disables_result_navigation(self) -> None:
         # Mirrors Escape after Enter has closed the prompt but retained the

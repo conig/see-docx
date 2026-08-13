@@ -21,9 +21,11 @@ from see_docx.viewer import APPLICATION_ID, DocxWindow
 
 TIMEOUT_MS = 20_000
 TARGET_TEXT = "Passed"
+SMOKE_TEST_CLASS = "codex-smoke-test"
 
 
 def main() -> int:
+    GLib.set_prgname(SMOKE_TEST_CLASS)
     parser = argparse.ArgumentParser()
     parser.add_argument("path", type=Path, help="A DOCX fixture containing bold 'Passed'")
     arguments = parser.parse_args()

@@ -1,7 +1,7 @@
 PREFIX ?= $(HOME)/.local
 PYTHON ?= python3
 
-.PHONY: test check install uninstall
+.PHONY: test check comments-smoke install uninstall
 
 test:
 	PYTHONPATH=src $(PYTHON) -m unittest discover -s tests -v
@@ -9,6 +9,9 @@ test:
 check:
 	PYTHONPATH=src $(PYTHON) -m compileall -q src tests
 	$(MAKE) test
+
+comments-smoke:
+	PYTHONPATH=src $(PYTHON) tests/ui_comments_smoke.py
 
 install:
 	install -d "$(PREFIX)/bin" "$(PREFIX)/lib/see-docx" "$(PREFIX)/share/applications"

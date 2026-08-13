@@ -169,6 +169,282 @@ class CommentSourceTests(unittest.TestCase):
         self.assertEqual(threads[0].reply_count, 1)
 
 
+class CommentFloatGeometryTests(unittest.TestCase):
+    def test_page_adjacent_bubble_uses_the_gutter_and_caps_width(self) -> None:
+        self.assertEqual(
+            viewer._comment_float_geometry(400, 1000, 800, 400, 200),
+            (418, 300, 320),
+        )
+
+    def test_page_adjacent_bubble_clamps_to_the_canvas_edges(self) -> None:
+        self.assertEqual(
+            viewer._comment_float_geometry(400, 1000, 800, 10, 400),
+            (418, 18, 320),
+        )
+        self.assertEqual(
+            viewer._comment_float_geometry(400, 1000, 800, 795, 400),
+            (418, 382, 320),
+        )
+
+    def test_page_adjacent_bubble_falls_back_when_the_gutter_is_too_narrow(self) -> None:
+        self.assertIsNone(
+            viewer._comment_float_geometry(700, 950, 800, 400, 200)
+        )
+
+    def test_page_adjacent_bubble_can_cross_the_document_rail_seam(self) -> None:
+        self.assertEqual(
+            viewer._comment_float_geometry(700, 1080, 800, 400, 200),
+            (718, 300, 320),
+        )
+
+    def test_page_adjacent_bubble_rejects_offscreen_anchors(self) -> None:
+        self.assertIsNone(
+            viewer._comment_float_geometry(-1, 1000, 800, 400, 200)
+        )
+        self.assertIsNone(
+            viewer._comment_float_geometry(400, 1000, 800, 801, 200)
+        )
+
+
+class CommentFloatContextTests(unittest.TestCase):
+    def test_unanchored_comment_uses_the_nearest_visible_page(self) -> None:
+        window = viewer.DocxWindow.__new__(viewer.DocxWindow)
+        window._active_comment_layer = SimpleNamespace(
+            get_allocated_height=lambda: 800
+        )
+        pages = [
+            SimpleNamespace(
+                top=0,
+                get_allocated_width=lambda: 600,
+                get_allocated_height=lambda: 800,
+            ),
+            SimpleNamespace(
+                top=820,
+                get_allocated_width=lambda: 600,
+                get_allocated_height=lambda: 800,
+            ),
+        ]
+        window.document = SimpleNamespace(_pages=pages)
+        window._translated_point = lambda page, _target, x, y: (
+            x,
+            page.top + y,
+        )
+
+        page_right, context = viewer.DocxWindow._visible_page_float_context(window)
+
+        self.assertEqual(page_right, (600, 400))
+        self.assertEqual(context, (600, 400))
+
+
+class _GhostStyle:
+    def __init__(self) -> None:
+        self.classes: set[str] = set()
+
+    def add_class(self, name: str) -> None:
+        self.classes.add(name)
+
+    def remove_class(self, name: str) -> None:
+        self.classes.discard(name)
+
+
+class _GhostWidget:
+    def __init__(self) -> None:
+        self.opacity = 1.0
+
+    def set_opacity(self, value: float) -> None:
+        self.opacity = value
+
+
+class _GhostCard:
+    def __init__(self) -> None:
+        self.style = _GhostStyle()
+        self.children = [_GhostWidget(), _GhostWidget()]
+        self.size_request: tuple[int, int] | None = None
+
+    def get_style_context(self) -> _GhostStyle:
+        return self.style
+
+    def set_size_request(self, width: int, height: int) -> None:
+        self.size_request = width, height
+
+    def get_children(self) -> list[_GhostWidget]:
+        return self.children
+
+
+class CommentGhostTests(unittest.TestCase):
+    def test_ghosting_keeps_the_original_card_and_exact_dimensions(self) -> None:
+        window = viewer.DocxWindow.__new__(viewer.DocxWindow)
+        card = _GhostCard()
+
+        viewer.DocxWindow._set_comment_card_ghost(window, card, True, 280, 124)
+
+        self.assertEqual(card.size_request, (280, 124))
+        self.assertIn("comment-rail-ghost", card.style.classes)
+        self.assertEqual([child.opacity for child in card.children], [0.0, 0.0])
+
+        viewer.DocxWindow._set_comment_card_ghost(window, card, False)
+
+        self.assertEqual(card.size_request, (-1, -1))
+        self.assertNotIn("comment-rail-ghost", card.style.classes)
+        self.assertEqual([child.opacity for child in card.children], [1.0, 1.0])
+
+    def test_enter_focuses_a_popped_out_comment_without_returning_it_to_the_rail(
+        self,
+    ) -> None:
+        """The visible popout must remain the interaction target after Enter."""
+
+        window = viewer.DocxWindow.__new__(viewer.DocxWindow)
+        rail_body = mock.Mock()
+        float_body = mock.Mock()
+        float_body.is_focus.return_value = True
+        float_card = SimpleNamespace(
+            get_style_context=lambda: _GhostStyle(),
+            grab_focus=mock.Mock(),
+        )
+        window._comments_focused = True
+        window._comments_visible = True
+        window._comment_body_focused = False
+        window._active_comment_id = "thread-1"
+        window._active_comment_float_id = "thread-1"
+        window._active_comment_float_card = float_card
+        window._active_comment_float_body = float_body
+        window._comment_body_scrollers = {"thread-1": rail_body}
+        window._comment_annotations = ()
+        window._comments_panel = SimpleNamespace(
+            get_style_context=lambda: _GhostStyle()
+        )
+        window._comment_cards = {}
+        window._layout_comments = lambda: None
+        window._restore_active_comment_card = mock.Mock()
+
+        viewer.DocxWindow._enter_comment_body(window)
+
+        self.assertTrue(window._comment_body_focused)
+        window._restore_active_comment_card.assert_not_called()
+        float_body.grab_focus.assert_called_once_with()
+        rail_body.grab_focus.assert_not_called()
+        self.assertIs(viewer.DocxWindow._active_comment_body(window), float_body)
+
+        viewer.DocxWindow._leave_comment_body(window)
+
+        window._restore_active_comment_card.assert_not_called()
+        float_card.grab_focus.assert_called_once_with()
+
+    def test_no_space_keeps_the_rail_card_normal_and_does_not_build_a_popout(self) -> None:
+        window = viewer.DocxWindow.__new__(viewer.DocxWindow)
+        card = _GhostCard()
+        card.get_allocated_width = lambda: 280
+        card.get_allocated_height = lambda: 124
+        window._comments_focused = True
+        window._comments_visible = True
+        window._comment_body_focused = False
+        window._active_comment_id = "thread-1"
+        window._active_comment_float_id = None
+        window._comment_cards = {"thread-1": card}
+        window._comment_float_geometry_for_thread = lambda *_args: None
+        window._build_comment_card = lambda *_args, **_kwargs: self.fail(
+            "a popout must not be built when there is no room"
+        )
+
+        viewer.DocxWindow._promote_active_comment_card(window)
+
+        self.assertNotIn("comment-rail-ghost", card.style.classes)
+        self.assertEqual([child.opacity for child in card.children], [1.0, 1.0])
+
+
+class CommentAnchorMatchTests(unittest.TestCase):
+    def test_context_disambiguates_a_short_repeated_comment_range(self) -> None:
+        source = "First three words. Second three words."
+        start = source.rfind("three")
+        end = start + len("three")
+        rendered = "First three words.\nSecond three words."
+
+        indices = viewer._comment_rendered_indices(source, start, end, rendered)
+
+        self.assertEqual(
+            " ".join("".join(rendered[index] for index in indices).split()),
+            "three",
+        )
+
+    def test_match_follows_normalized_line_wrapping(self) -> None:
+        source = "Before attached phrase after"
+        start = source.index("attached")
+        end = start + len("attached phrase")
+        rendered = "Before attached\nphrase after"
+
+        indices = viewer._comment_rendered_indices(source, start, end, rendered)
+
+        self.assertEqual(
+            " ".join("".join(rendered[index] for index in indices).split()),
+            "attached phrase",
+        )
+
+
+class CommentFitTests(unittest.TestCase):
+    def _window(self) -> tuple[object, SimpleNamespace, list[str]]:
+        window = viewer.DocxWindow.__new__(viewer.DocxWindow)
+        calls: list[str] = []
+        document = SimpleNamespace(
+            has_document=True,
+            zoom=1.25,
+            widget=SimpleNamespace(get_vadjustment=lambda: object()),
+        )
+
+        def fit_to_width() -> None:
+            calls.append("fit")
+            document.zoom = 0.82
+
+        def set_zoom(zoom: float) -> None:
+            calls.append(f"restore:{zoom}")
+            document.zoom = zoom
+
+        document.fit_to_width = fit_to_width
+        document.set_zoom = set_zoom
+        window.document = document
+        window.get_visible = lambda: True
+        window._comments_visible = True
+        window._comments_available = True
+        window._comments_zoom_before_fit = None
+        window._comments_auto_fit_zoom = None
+        window._schedule_active_comment_position = lambda: None
+        return window, document, calls
+
+    def test_comment_rail_fits_once_and_restores_automatic_zoom(self) -> None:
+        window, document, calls = self._window()
+
+        viewer.DocxWindow._fit_document_for_comments(window)
+        self.assertEqual(document.zoom, 0.82)
+        self.assertEqual(window._comments_zoom_before_fit, 1.25)
+        self.assertEqual(window._comments_auto_fit_zoom, 0.82)
+
+        viewer.DocxWindow._fit_document_for_comments(window)
+        # A second layout pass is allowed to recompute the target if the
+        # document column changed size while the rail was revealing.
+        self.assertEqual(calls, ["fit", "fit"])
+
+        viewer.DocxWindow._restore_document_zoom_after_comments(window)
+        self.assertEqual(document.zoom, 1.25)
+        self.assertEqual(calls, ["fit", "fit", "restore:1.25"])
+
+    def test_manual_zoom_change_is_preserved_when_comments_close(self) -> None:
+        window, document, calls = self._window()
+
+        viewer.DocxWindow._fit_document_for_comments(window)
+        document.zoom = 1.0
+        viewer.DocxWindow._restore_document_zoom_after_comments(window)
+
+        self.assertEqual(document.zoom, 1.0)
+        self.assertEqual(calls, ["fit"])
+
+    def test_queued_fit_stops_when_the_window_is_hidden(self) -> None:
+        window, _document, calls = self._window()
+        window.get_visible = lambda: False
+
+        viewer.DocxWindow._fit_document_for_comments(window)
+
+        self.assertEqual(calls, [])
+
+
 class _CommentMarkContext:
     def __init__(self) -> None:
         self.colors: list[tuple[float, float, float, float]] = []
@@ -277,6 +553,8 @@ class _CommentToggleWindow:
         self._comment_body_scroll_calls: list[int] = []
         self._activate_comment_calls: list[tuple[int, bool]] = []
         self._scroll_active_comment_into_view = lambda: False
+        self._fit_document_for_comments = lambda: False
+        self._restore_document_zoom_after_comments = lambda: None
         self._active_comment_body = lambda: (
             SimpleNamespace() if self._comment_body_focused else None
         )

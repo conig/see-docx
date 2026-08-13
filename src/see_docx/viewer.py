@@ -80,15 +80,20 @@ COMMENTS_PANEL_MAX_WIDTH = 420
 COMMENTS_PANEL_FRACTION = 0.34
 COMMENTS_DOCUMENT_MIN_WIDTH = 520
 COMMENTS_PANEL_GUTTER = 16
-COMMENTS_HEADER_HEIGHT = 50
+COMMENTS_HEADER_HEIGHT = 34
 COMMENT_CARD_GAP = 12
 COMMENT_VIEWPORT_BUFFER = 120
 COMMENT_INACTIVE_BODY_HEIGHT = 76
 COMMENT_BODY_MIN_HEIGHT = 28
 COMMENT_ACTIVE_BODY_MAX_HEIGHT = 320
+COMMENT_ANCHOR_CONTEXT_CHARS = 48
+COMMENT_ANCHOR_MATCH_CHARS = 96
 # Keep the right edge of every card fixed. The inactive left inset leaves the
 # active card roughly 20% wider without moving either card's right edge.
 COMMENT_INACTIVE_CARD_INSET = 48
+COMMENT_FLOAT_GUTTER = 18
+COMMENT_FLOAT_MIN_WIDTH = 240
+COMMENT_FLOAT_MAX_WIDTH = 320
 OUTLINE_HEADING_MAX_CHARS = 22
 OUTLINE_NAV_SPACING = 7
 OUTLINE_REFERENCE_MARGIN_WIDTH = OUTLINE_NAV_SPACING * 3
@@ -106,14 +111,17 @@ OUTLINE_LOCATOR_RIPPLE_FADE_START_MS = 400
 OUTLINE_LOCATOR_FALLBACK_HEIGHT = 34.0
 READING_PROGRESS_DURATION_MS = 180
 READING_PROGRESS_TICK_MS = 16
+ACTION_NOTIFICATION_DURATION_MS = 2400
+ACTION_NOTIFICATION_TRANSITION_MS = 180
 HINT_CHARS = "asdfghjkl"
 _WORDPROCESSINGML = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 _WORD_2010_WORDML = "{http://schemas.microsoft.com/office/word/2010/wordml}"
 _WORD_2012_WORDML = "{http://schemas.microsoft.com/office/word/2012/wordml}"
-EXPORT_FORMATS = ("PDF", "Plain text")
+EXPORT_FORMATS = ("PDF", "Plain text", "Markdown")
 EXPORT_FORMAT_DESCRIPTIONS = {
     "PDF": "Portable Document Format",
     "Plain text": "UTF-8 text via Pandoc",
+    "Markdown": "Pandoc Markdown with ATX headings",
 }
 
 
@@ -198,6 +206,14 @@ def _plain_text_export_path(path: Path) -> Path:
     return path.with_name(f"{path.name}.txt")
 
 
+def _markdown_export_path(path: Path) -> Path:
+    """Ensure the destination selected for Markdown has an MD suffix."""
+
+    if path.suffix.lower() == ".md":
+        return path
+    return path.with_name(f"{path.name}.md")
+
+
 def _number_to_hint(number: int, width: int) -> str:
     """Return qutebrowser's base-N hint string for *number*."""
 
@@ -251,6 +267,18 @@ def _fit_zoom_for_viewport(
     width_zoom = (viewport_width - 2 * PAGE_MARGIN) / page_width
     height_zoom = (viewport_height - 2 * PAGE_MARGIN) / page_height
     return max(MIN_FIT_ZOOM, min(width_zoom, height_zoom))
+
+
+def _zoom_for_resized_width(
+    zoom: float,
+    previous_width: float,
+    current_width: float,
+) -> float:
+    """Scale zoom with the window so page and whitespace proportions persist."""
+
+    if previous_width <= 0 or current_width <= 0:
+        return zoom
+    return max(MIN_FIT_ZOOM, zoom * current_width / previous_width)
 
 
 def _lookup_color(widget: Gtk.Widget, name: str, fallback: str) -> str:
@@ -408,6 +436,36 @@ def _coalesce_comment_rectangles(
     return tuple(merged)
 
 
+def _comment_float_geometry(
+    page_right: float,
+    canvas_width: float,
+    canvas_height: float,
+    anchor_y: float,
+    card_height: float,
+) -> tuple[int, int, int] | None:
+    """Return a page-adjacent active-comment rectangle when it can fit."""
+
+    if (
+        page_right < 0
+        or page_right > canvas_width
+        or anchor_y < 0
+        or anchor_y > canvas_height
+    ):
+        return None
+    left = page_right + COMMENT_FLOAT_GUTTER
+    right = canvas_width - COMMENT_FLOAT_GUTTER
+    available_width = right - left
+    if available_width < COMMENT_FLOAT_MIN_WIDTH:
+        return None
+    width = min(COMMENT_FLOAT_MAX_WIDTH, available_width)
+    height = min(card_height, max(1.0, canvas_height - 2 * COMMENT_FLOAT_GUTTER))
+    top = min(
+        max(COMMENT_FLOAT_GUTTER, anchor_y - height / 2),
+        max(COMMENT_FLOAT_GUTTER, canvas_height - COMMENT_FLOAT_GUTTER - height),
+    )
+    return round(left), round(top), round(width)
+
+
 def _app_css(widget: Gtk.Widget) -> bytes:
     palette = _theme_palette(widget)
     return f"""
@@ -478,13 +536,13 @@ window.see-docx-window {{
 }}
 .see-docx-comments-header {{
   min-height: {COMMENTS_HEADER_HEIGHT}px;
-  padding: 7px 12px 6px;
+  padding: 4px 12px;
 }}
 .see-docx-comments-header-top {{
-  min-height: 17px;
+  min-height: 16px;
 }}
 .see-docx-comments-header-meta {{
-  min-height: 14px;
+  min-height: 12px;
 }}
 .see-docx-comments scrolledwindow,
 .see-docx-comments scrolledwindow viewport {{
@@ -560,6 +618,21 @@ window.see-docx-window {{
 }}
 .see-docx-comment-thread.active .see-docx-comment-anchor {{
   font-size: 0.82em;
+}}
+.see-docx-comment-thread.active-comment-float {{
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.38);
+  border-color: {palette["accent"]};
+}}
+.see-docx-comment-thread.active-comment-float.comment-body-focused {{
+  box-shadow: 0 0 0 1px {palette["highlight"]}, 0 10px 28px rgba(0, 0, 0, 0.38);
+}}
+.see-docx-comment-thread.comment-rail-ghost {{
+  background-color: transparent;
+  border: 1px dashed {palette["separator"]};
+  border-left: 2px dashed {palette["accent"]};
+  border-radius: 5px;
+  box-shadow: 0 7px 18px rgba(0, 0, 0, 0.24),
+    inset 0 1px 0 rgba(255, 255, 255, 0.025);
 }}
 .see-docx-comment-thread-label {{
   color: {palette["muted"]};
@@ -718,6 +791,34 @@ window.see-docx-window {{
 }}
 .see-docx-export-status {{
   padding: 8px 4px 2px;
+}}
+.see-docx-notification {{
+  background-color: {palette["panel"]};
+  border: 1px solid {palette["separator"]};
+  border-left: 3px solid {palette["accent"]};
+  border-radius: 4px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.34);
+  padding: 8px 12px 9px 10px;
+}}
+.see-docx-notification.warning {{
+  border-left-color: {palette["highlight"]};
+}}
+.see-docx-notification-mark {{
+  color: {palette["accent"]};
+  font-size: 1.08em;
+  font-weight: 800;
+}}
+.see-docx-notification.warning .see-docx-notification-mark {{
+  color: {palette["highlight"]};
+}}
+.see-docx-notification-title {{
+  color: {palette["foreground"]};
+  font-size: 0.90em;
+  font-weight: 700;
+}}
+.see-docx-notification-detail {{
+  color: {palette["muted"]};
+  font-size: 0.76em;
 }}
 .see-docx-status {{
   background-color: {palette["panel_dark"]};
@@ -1158,11 +1259,13 @@ class _DocxRichTextSource:
         fragments: tuple[_DocxSelectionFragment, ...],
         selection_text: str,
         comments: tuple[DocumentComment, ...] = (),
+        selection_flow_texts: dict[str, tuple[str, ...]] | None = None,
     ) -> None:
         self._blocks = blocks
         self._fragments = fragments
         self._selection_text = selection_text
         self.comments = comments
+        self._selection_flow_texts = selection_flow_texts or {}
 
     @property
     def plain_text(self) -> str:
@@ -1392,6 +1495,138 @@ def _fold_selection_whitespace(text: str) -> tuple[str, list[int]]:
     return "".join(folded), indices
 
 
+def _selection_flow_occurrences(
+    rendered_text: str, flow_text: str
+) -> tuple[tuple[int, ...], ...]:
+    """Find every rendered glyph span matching one OOXML story fragment."""
+
+    rendered, rendered_indices = _fold_selection_whitespace(rendered_text)
+    needle, _needle_indices = _fold_selection_whitespace(flow_text)
+    if not rendered or not needle:
+        return ()
+    occurrences: list[tuple[int, ...]] = []
+    offset = 0
+    while (start := rendered.find(needle, offset)) >= 0:
+        occurrences.append(
+            tuple(rendered_indices[start : start + len(needle)])
+        )
+        offset = start + 1
+    return tuple(occurrences)
+
+
+def _rendered_selection_flow_map(
+    text: str,
+    rectangles: list[Poppler.Rectangle],
+    page_height: float,
+    flow_texts: dict[str, tuple[str, ...]],
+) -> dict[int, str]:
+    """Classify rendered glyphs as main text, header, or footer."""
+
+    explicit: dict[str, set[int]] = {"header": set(), "footer": set()}
+    for flow in ("header", "footer"):
+        for flow_text in flow_texts.get(flow, ()):
+            candidates: list[tuple[float, tuple[int, ...]]] = []
+            for occurrence in _selection_flow_occurrences(text, flow_text):
+                visible = [
+                    index
+                    for index in occurrence
+                    if text[index] not in "\r\n"
+                ]
+                if not visible:
+                    continue
+                centre = sum(
+                    (
+                        float(rectangles[index].y1)
+                        + float(rectangles[index].y2)
+                    )
+                    / 2
+                    for index in visible
+                ) / len(visible)
+                if flow == "header" and centre < page_height / 2:
+                    candidates.append((centre, occurrence))
+                elif flow == "footer" and centre > page_height / 2:
+                    candidates.append((centre, occurrence))
+            if candidates:
+                chosen = (
+                    min(candidates, key=lambda candidate: candidate[0])
+                    if flow == "header"
+                    else max(candidates, key=lambda candidate: candidate[0])
+                )
+                explicit[flow].update(chosen[1])
+
+    result: dict[int, str] = {}
+    header_bottom = max(
+        (float(rectangles[index].y2) for index in explicit["header"]),
+        default=None,
+    )
+    footer_top = min(
+        (float(rectangles[index].y1) for index in explicit["footer"]),
+        default=None,
+    )
+    for index, (character, rectangle) in enumerate(
+        zip(text, rectangles, strict=True)
+    ):
+        if character in "\r\n":
+            continue
+        centre = (float(rectangle.y1) + float(rectangle.y2)) / 2
+        if header_bottom is not None and centre <= header_bottom:
+            result[index] = "header"
+        elif footer_top is not None and centre >= footer_top:
+            result[index] = "footer"
+    return result
+
+
+def _comment_rendered_indices(
+    source_text: str,
+    source_start: int,
+    source_end: int,
+    rendered_text: str,
+) -> tuple[int, ...]:
+    """Find the rendered glyph span for a comment range using nearby context."""
+
+    if (
+        not rendered_text
+        or source_start < 0
+        or source_end <= source_start
+        or source_start >= len(source_text)
+    ):
+        return ()
+    source_end = min(source_end, len(source_text))
+    folded_rendered, rendered_indices = _fold_selection_whitespace(rendered_text)
+    folded_source, _source_indices = _fold_selection_whitespace(
+        source_text[source_start:source_end]
+    )
+    if not folded_rendered or not folded_source:
+        return ()
+
+    focus = folded_source[:COMMENT_ANCHOR_MATCH_CHARS]
+    short_focus = folded_source[: COMMENT_ANCHOR_CONTEXT_CHARS]
+    context_start = max(0, source_start - COMMENT_ANCHOR_CONTEXT_CHARS)
+    context_end = min(
+        len(source_text), source_start + COMMENT_ANCHOR_MATCH_CHARS
+    )
+    folded_context, _context_indices = _fold_selection_whitespace(
+        source_text[context_start:context_end]
+    )
+    focus_offset = folded_context.find(focus)
+    candidates = (
+        (folded_context, focus_offset, len(focus)),
+        (focus, 0, len(focus)),
+        (short_focus, 0, len(short_focus)),
+    )
+    for needle, offset, length in candidates:
+        if not needle or offset < 0:
+            continue
+        match_start = folded_rendered.find(needle)
+        if match_start < 0:
+            continue
+        focus_start = min(match_start + offset, len(rendered_indices))
+        focus_end = min(focus_start + length, len(rendered_indices))
+        if focus_start < focus_end:
+            return tuple(rendered_indices[focus_start:focus_end])
+    return ()
+
+
 def _restore_docx_paragraph_boundaries(
     source_text: str, selected_text: str
 ) -> str | None:
@@ -1571,6 +1806,56 @@ def _docx_relationships(archive: zipfile.ZipFile) -> dict[str, str]:
     return result
 
 
+def _docx_selection_flow_texts(
+    archive: zipfile.ZipFile,
+) -> dict[str, tuple[str, ...]]:
+    """Return visible header/footer fragments referenced by the document."""
+
+    try:
+        relationships = ET.fromstring(archive.read("word/_rels/document.xml.rels"))
+    except (ET.ParseError, KeyError):
+        return {}
+    flows: dict[str, list[str]] = {"header": [], "footer": []}
+    relationship_prefix = (
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/"
+    )
+    for relationship in relationships:
+        relationship_type = relationship.get("Type", "")
+        flow = relationship_type.removeprefix(relationship_prefix)
+        if flow not in flows:
+            continue
+        target = relationship.get("Target", "")
+        if not target or ".." in Path(target).parts:
+            continue
+        target_path = Path(target)
+        part_name = (
+            target.lstrip("/")
+            if target_path.is_absolute()
+            else (Path("word") / target_path).as_posix()
+        )
+        try:
+            root = ET.fromstring(archive.read(part_name))
+        except (ET.ParseError, KeyError):
+            continue
+        for paragraph in root.findall(f".//{_WORDPROCESSINGML}p"):
+            candidates = [_docx_element_text(paragraph)]
+            candidates.extend(
+                run.text
+                for run_element in paragraph.findall(f".//{_WORDPROCESSINGML}r")
+                if (run := _docx_run(run_element)) is not None
+                and len(run.text.strip()) >= 2
+                and not run.text.strip().isdecimal()
+            )
+            for text in candidates:
+                if text and text not in flows[flow]:
+                    flows[flow].append(text)
+    return {
+        flow: tuple(texts)
+        for flow, texts in flows.items()
+        if texts
+    }
+
+
 def _docx_element_text(element: ET.Element) -> str:
     """Extract visible Word text from a comment body or inline container."""
 
@@ -1739,6 +2024,7 @@ def _docx_rich_text_source(path: Path) -> _DocxRichTextSource | None:
             document = ET.fromstring(archive.read("word/document.xml"))
             relationships = _docx_relationships(archive)
             comment_records = _docx_comment_records(archive)
+            selection_flow_texts = _docx_selection_flow_texts(archive)
     except (ET.ParseError, KeyError, OSError, zipfile.BadZipFile):
         return None
 
@@ -1820,7 +2106,11 @@ def _docx_rich_text_source(path: Path) -> _DocxRichTextSource | None:
         if identifier in comment_records and start < end
     )
     return _DocxRichTextSource(
-        tuple(blocks), tuple(fragments), "".join(selection_parts), comments
+        tuple(blocks),
+        tuple(fragments),
+        "".join(selection_parts),
+        comments,
+        selection_flow_texts,
     )
 
 
@@ -2005,6 +2295,8 @@ class PdfPage(Gtk.DrawingArea):
         self._selection_anchor: tuple[float, float] | None = None
         self._text_selection_start: tuple[float, float] | None = None
         self._text_selection_end: tuple[float, float] | None = None
+        self._text_selection_flow: str | None = None
+        self._selection_flow_map: dict[int, str] = {}
         self._selection_handler = selection_handler
         self._selection_scroll_handler = selection_scroll_handler
         self._text_cursor: Gdk.Cursor | None = None
@@ -2142,6 +2434,9 @@ class PdfPage(Gtk.DrawingArea):
         text: str,
         rectangles: list[Poppler.Rectangle],
         point: tuple[float, float],
+        *,
+        flow_map: dict[int, str] | None = None,
+        flow: str | None = None,
     ) -> int | None:
         """Return the selectable glyph closest to a document-space pointer."""
 
@@ -2164,6 +2459,7 @@ class PdfPage(Gtk.DrawingArea):
                 zip(text, rectangles, strict=True)
             )
             if character not in "\r\n"
+            and (flow is None or (flow_map or {}).get(index, "main") == flow)
         )
         try:
             return min(candidates)[2]
@@ -2185,23 +2481,47 @@ class PdfPage(Gtk.DrawingArea):
 
         start = getattr(self, "_text_selection_start", None)
         end = getattr(self, "_text_selection_end", None)
+        flow = getattr(self, "_text_selection_flow", None)
+        flow_map = getattr(self, "_selection_flow_map", {})
         if start is not None and end is not None:
-            first = self._nearest_glyph_index(text, rectangles, start)
-            last = self._nearest_glyph_index(text, rectangles, end)
+            first = self._nearest_glyph_index(
+                text, rectangles, start, flow_map=flow_map, flow=flow
+            )
+            last = self._nearest_glyph_index(
+                text, rectangles, end, flow_map=flow_map, flow=flow
+            )
             if first is not None and last is not None:
                 first, last = sorted((first, last))
+                selected_text = "".join(
+                    character
+                    for index, character in enumerate(text)
+                    if first <= index <= last
+                    and (
+                        flow is None
+                        or flow_map.get(index, "main") == flow
+                    )
+                )
                 selected_rectangles = [
                     rectangle
                     for index, (character, rectangle) in enumerate(
                         zip(text, rectangles, strict=True)
                     )
-                    if first <= index <= last and character not in "\r\n"
+                    if first <= index <= last
+                    and character not in "\r\n"
+                    and (
+                        flow is None
+                        or flow_map.get(index, "main") == flow
+                    )
                 ]
-                return text[first : last + 1], selected_rectangles
+                return selected_text, selected_rectangles
 
         selected_text: list[str] = []
         selected_rectangles: list[Poppler.Rectangle] = []
-        for character, rectangle in zip(text, rectangles, strict=True):
+        for index, (character, rectangle) in enumerate(
+            zip(text, rectangles, strict=True)
+        ):
+            if flow is not None and flow_map.get(index, "main") != flow:
+                continue
             if character in "\r\n":
                 if selection.top <= float(rectangle.y1) <= selection.bottom:
                     selected_text.append(character)
@@ -2247,14 +2567,22 @@ class PdfPage(Gtk.DrawingArea):
             return None
         if not has_layout or len(text) != len(rectangles):
             return None
-        first = self._nearest_glyph_index(text, rectangles, start)
-        last = self._nearest_glyph_index(text, rectangles, end)
+        flow = getattr(self, "_text_selection_flow", None)
+        flow_map = getattr(self, "_selection_flow_map", {})
+        first = self._nearest_glyph_index(
+            text, rectangles, start, flow_map=flow_map, flow=flow
+        )
+        last = self._nearest_glyph_index(
+            text, rectangles, end, flow_map=flow_map, flow=flow
+        )
         if first is None or last is None:
             return None
         source_indices = [
             mapping[index]
             for index in range(min(first, last), max(first, last) + 1)
-            if index in mapping and text[index] not in "\r\n"
+            if index in mapping
+            and text[index] not in "\r\n"
+            and (flow is None or flow_map.get(index, "main") == flow)
         ]
         if not source_indices:
             return None
@@ -2284,12 +2612,14 @@ class PdfPage(Gtk.DrawingArea):
         *,
         start: tuple[float, float] | None = None,
         end: tuple[float, float] | None = None,
+        flow: str | None = None,
     ) -> None:
         """Render one document-coordinated selection segment on this page."""
 
         self._text_selection = selection
         self._text_selection_start = start
         self._text_selection_end = end
+        self._text_selection_flow = flow
         self.queue_draw()
 
     def clear_text_selection(self) -> None:
@@ -2300,13 +2630,30 @@ class PdfPage(Gtk.DrawingArea):
         self._text_selection = None
         self._text_selection_start = None
         self._text_selection_end = None
+        self._text_selection_flow = None
         self.queue_draw()
+
+    def selection_flow_at(self, point: tuple[float, float]) -> str:
+        """Return the semantic text flow nearest a PDF-space pointer."""
+
+        try:
+            text = self._page.get_text()
+            has_layout, rectangles = self._page.get_text_layout()
+        except (AttributeError, TypeError, ValueError):
+            return "main"
+        if not has_layout or len(text) != len(rectangles):
+            return "main"
+        index = self._nearest_glyph_index(text, rectangles, point)
+        if index is None:
+            return "main"
+        return getattr(self, "_selection_flow_map", {}).get(index, "main")
 
     def _update_text_selection(self, point: tuple[float, float]) -> bool:
         if self._selection_anchor is None:
             return False
         self._text_selection_start = self._selection_anchor
         self._text_selection_end = point
+        self._text_selection_flow = self.selection_flow_at(self._selection_anchor)
         self._text_selection = _text_selection_bounds(
             start=self._selection_anchor,
             end=point,
@@ -2590,6 +2937,7 @@ class PdfDocumentView:
         self._selection_anchor: tuple[float, float] | None = None
         self._selection_endpoint: tuple[float, float] | None = None
         self._selection_anchor_page: PdfPage | None = None
+        self._selection_anchor_flow = "main"
         self._selection_drag_active = False
         self._selection_auto_scroll_source = 0
         self._selection_auto_scroll_page: PdfPage | None = None
@@ -2749,6 +3097,7 @@ class PdfDocumentView:
         self._selection_anchor = None
         self._selection_endpoint = None
         self._selection_anchor_page = None
+        self._selection_anchor_flow = "main"
         self._selection_drag_active = False
         self._clear_page_text_selections()
 
@@ -2767,6 +3116,9 @@ class PdfDocumentView:
             self._clear_document_selection()
             self._selection_anchor = document_point
             self._selection_anchor_page = page
+            self._selection_anchor_flow = page.selection_flow_at(
+                self._page_point_for_document(page, document_point)
+            )
             self._selection_drag_active = True
         elif not self._selection_drag_active:
             return
@@ -2812,6 +3164,7 @@ class PdfDocumentView:
             TextSelection,
             tuple[float, float],
             tuple[float, float],
+            str,
         ]
     ]:
         """Split the document-level drag into Poppler regions per page."""
@@ -2824,6 +3177,26 @@ class PdfDocumentView:
         endpoint_index = self._selection_page_index(endpoint)
         if anchor_index is None or endpoint_index is None:
             return []
+        flow = getattr(self, "_selection_anchor_flow", "main")
+        if flow != "main":
+            page = self._pages[anchor_index]
+            start = self._page_point_for_document(page, anchor)
+            end = self._page_point_for_document(page, endpoint)
+            return [
+                (
+                    page,
+                    _text_selection_bounds(
+                        start=start,
+                        end=end,
+                        page_width=page._width,
+                        page_height=page._height,
+                        line_padding=TEXT_SELECTION_LINE_PADDING / page._zoom,
+                    ),
+                    start,
+                    end,
+                    flow,
+                )
+            ]
         if self._selection_is_forward(anchor, endpoint):
             first_index, first_point = anchor_index, anchor
             last_index, last_point = endpoint_index, endpoint
@@ -2837,6 +3210,7 @@ class PdfDocumentView:
                 TextSelection,
                 tuple[float, float],
                 tuple[float, float],
+                str,
             ]
         ] = []
         for index in range(first_index, last_index + 1):
@@ -2865,6 +3239,7 @@ class PdfDocumentView:
                     ),
                     start,
                     end,
+                    flow,
                 )
             )
         return regions
@@ -2884,6 +3259,7 @@ class PdfDocumentView:
             except (AttributeError, TypeError, ValueError):
                 text = ""
             page._source_character_map = {}
+            page._selection_flow_map = {}
             offsets.append(cursor)
             page_text.append(text)
             cursor += len(text)
@@ -2894,23 +3270,37 @@ class PdfDocumentView:
         rendered_text = "\n".join(page_text)
         rendered, rendered_indices = _fold_selection_whitespace(rendered_text)
         source_text, source_indices = _fold_selection_whitespace(source._selection_text)
-        if not rendered or not source_text:
-            return
-        matcher = SequenceMatcher(None, rendered, source_text)
-        for match in matcher.get_matching_blocks():
-            for delta in range(match.size):
-                rendered_index = rendered_indices[match.a + delta]
-                page_index = 0
-                while (
-                    page_index + 1 < len(offsets)
-                    and rendered_index >= offsets[page_index + 1]
-                ):
-                    page_index += 1
-                local_index = rendered_index - offsets[page_index]
-                if 0 <= local_index < len(page_text[page_index]):
-                    self._pages[page_index]._source_character_map[local_index] = (
-                        source_indices[match.b + delta]
-                    )
+        if rendered and source_text:
+            matcher = SequenceMatcher(None, rendered, source_text)
+            for match in matcher.get_matching_blocks():
+                for delta in range(match.size):
+                    rendered_index = rendered_indices[match.a + delta]
+                    page_index = 0
+                    while (
+                        page_index + 1 < len(offsets)
+                        and rendered_index >= offsets[page_index + 1]
+                    ):
+                        page_index += 1
+                    local_index = rendered_index - offsets[page_index]
+                    if 0 <= local_index < len(page_text[page_index]):
+                        self._pages[page_index]._source_character_map[local_index] = (
+                            source_indices[match.b + delta]
+                        )
+
+        flow_texts = getattr(source, "_selection_flow_texts", {})
+        for page, text in zip(self._pages, page_text, strict=True):
+            try:
+                has_layout, rectangles = page._page.get_text_layout()
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if not has_layout or len(text) != len(rectangles):
+                continue
+            page._selection_flow_map = _rendered_selection_flow_map(
+                text,
+                rectangles,
+                page._height,
+                flow_texts,
+            )
 
     def _map_comments_to_pages(self) -> None:
         """Map OOXML comment ranges onto the PDF glyph rectangles they cover."""
@@ -2919,14 +3309,20 @@ class PdfDocumentView:
             index: [] for index in range(len(self._pages))
         }
         anchors: list[CommentAnchor] = []
+        source_text = (
+            self._rich_source._selection_text
+            if self._rich_source is not None
+            else ""
+        )
         for comment in self.comments:
-            matches_by_page: dict[
+            mapped_matches_by_page: dict[
+                int, list[tuple[float, float, float, float]]
+            ] = {}
+            direct_matches_by_page: dict[
                 int, list[tuple[float, float, float, float]]
             ] = {}
             for page_index, page in enumerate(self._pages):
                 mapping = getattr(page, "_source_character_map", {})
-                if not mapping:
-                    continue
                 try:
                     text = page._page.get_text()
                     has_layout, rectangles = page._page.get_text_layout()
@@ -2934,14 +3330,17 @@ class PdfDocumentView:
                     continue
                 if not has_layout or len(text) != len(rectangles):
                     continue
-                page_rectangles = []
+                mapped_rectangles = []
                 for rendered_index, source_index in mapping.items():
                     if not comment.source_start <= source_index < comment.source_end:
                         continue
-                    if not 0 <= rendered_index < len(text) or text[rendered_index].isspace():
+                    if (
+                        not 0 <= rendered_index < len(text)
+                        or text[rendered_index].isspace()
+                    ):
                         continue
                     rectangle = rectangles[rendered_index]
-                    page_rectangles.append(
+                    mapped_rectangles.append(
                         (
                             min(float(rectangle.x1), float(rectangle.x2)),
                             min(float(rectangle.y1), float(rectangle.y2)),
@@ -2949,12 +3348,40 @@ class PdfDocumentView:
                             max(float(rectangle.y1), float(rectangle.y2)),
                         )
                     )
-                if page_rectangles:
-                    matches_by_page[page_index] = page_rectangles
-                    marks_by_page[page_index].extend(
-                        CommentMark(comment.comment_id, rectangle)
-                        for rectangle in page_rectangles
+                if mapped_rectangles:
+                    mapped_matches_by_page[page_index] = mapped_rectangles
+
+                direct_indices = _comment_rendered_indices(
+                    source_text,
+                    comment.source_start,
+                    comment.source_end,
+                    text,
+                )
+                direct_rectangles = []
+                for rendered_index in direct_indices:
+                    if (
+                        not 0 <= rendered_index < len(text)
+                        or text[rendered_index].isspace()
+                    ):
+                        continue
+                    rectangle = rectangles[rendered_index]
+                    direct_rectangles.append(
+                        (
+                            min(float(rectangle.x1), float(rectangle.x2)),
+                            min(float(rectangle.y1), float(rectangle.y2)),
+                            max(float(rectangle.x1), float(rectangle.x2)),
+                            max(float(rectangle.y1), float(rectangle.y2)),
+                        )
                     )
+                if direct_rectangles:
+                    direct_matches_by_page[page_index] = direct_rectangles
+
+            matches_by_page = direct_matches_by_page or mapped_matches_by_page
+            for page_index, page_rectangles in matches_by_page.items():
+                marks_by_page[page_index].extend(
+                    CommentMark(comment.comment_id, rectangle)
+                    for rectangle in page_rectangles
+                )
             if matches_by_page:
                 page_index = min(matches_by_page)
                 anchors.append(
@@ -2973,7 +3400,7 @@ class PdfDocumentView:
 
         regions = self._selection_regions()
         selected_page_ids = {
-            id(page) for page, _selection, _start, _end in regions
+            id(page) for page, _selection, _start, _end, _flow in regions
         }
         for page in self._pages:
             if id(page) not in selected_page_ids:
@@ -2981,8 +3408,8 @@ class PdfDocumentView:
 
         text: list[str] = []
         source_ranges: list[tuple[int, int]] = []
-        for page, selection, start, end in regions:
-            page.set_text_selection(selection, start=start, end=end)
+        for page, selection, start, end, flow in regions:
+            page.set_text_selection(selection, start=start, end=end, flow=flow)
             selected = page.selected_text(selection)
             if selected:
                 text.append(selected)
@@ -3101,10 +3528,18 @@ class PdfDocumentView:
         self._pages_box.show_all()
         self._notify_page_changed()
 
-    def set_zoom(self, zoom: float, *, minimum: float = MIN_ZOOM) -> bool:
+    def set_zoom(
+        self,
+        zoom: float,
+        *,
+        minimum: float = MIN_ZOOM,
+        maximum: float | None = MAX_ZOOM,
+    ) -> bool:
         if self._document is None:
             return False
-        zoom = min(max(zoom, minimum), MAX_ZOOM)
+        zoom = max(zoom, minimum)
+        if maximum is not None:
+            zoom = min(zoom, maximum)
         if abs(zoom - self.zoom) < 0.001:
             return False
         position = self.capture_position()
@@ -3438,6 +3873,7 @@ class DocxWindow(Gtk.ApplicationWindow):
         self._comments_summary: Gtk.Label
         self._comments_count: Gtk.Label
         self._comment_line_layer: Gtk.DrawingArea
+        self._active_comment_layer: Gtk.Fixed
         self._comment_cards: dict[str, Gtk.Box] = {}
         self._comment_body_scrollers: dict[str, Gtk.ScrolledWindow] = {}
         self._comment_annotations: tuple[DocumentComment, ...] = ()
@@ -3448,8 +3884,23 @@ class DocxWindow(Gtk.ApplicationWindow):
         self._comments_visible = False
         self._comments_focused = False
         self._comment_body_focused = False
+        self._active_comment_float_id: str | None = None
+        self._active_comment_float_card: Gtk.Box | None = None
+        self._active_comment_float_body: Gtk.ScrolledWindow | None = None
+        self._active_comment_float_height = 0.0
+        self._active_comment_float_geometry: tuple[int, int, int, int] | None = None
+        self._active_comment_position_source = 0
+        self._comments_zoom_before_fit: float | None = None
+        self._comments_auto_fit_zoom: float | None = None
         self._url_hint_layer: Gtk.Fixed
         self._path_status: Gtk.Label
+        self._notification_revealer: Gtk.Revealer
+        self._notification_box: Gtk.Box
+        self._notification_mark: Gtk.Label
+        self._notification_title: Gtk.Label
+        self._notification_detail: Gtk.Label
+        self._notification_source = 0
+        self._viewport_resize_width = 0
         self._reading_progress_source = 0
         self._reading_progress_start = 0.0
         self._reading_progress_target = 0.0
@@ -3460,6 +3911,7 @@ class DocxWindow(Gtk.ApplicationWindow):
         self.set_icon_name("x-office-document")
         self.connect("delete-event", self._on_delete)
         self.connect("key-press-event", self._on_key_press)
+        self.connect("size-allocate", self._on_window_size_allocate)
         _style(self, "see-docx-window")
 
         provider = Gtk.CssProvider()
@@ -3479,6 +3931,9 @@ class DocxWindow(Gtk.ApplicationWindow):
         workspace = Gtk.Overlay()
         workspace.set_hexpand(True)
         workspace.set_vexpand(True)
+        workspace.connect(
+            "get-child-position", self._on_workspace_overlay_child_position
+        )
         self._document_layout = Gtk.Grid()
         self._document_layout.set_column_homogeneous(False)
         self._document_layout.set_row_homogeneous(False)
@@ -3524,6 +3979,16 @@ class DocxWindow(Gtk.ApplicationWindow):
         self.document.widget.set_vexpand(True)
         self.document.widget.connect("focus-in-event", self._on_document_focus_in)
         document_canvas.add(self.document.widget)
+        self._active_comment_layer = Gtk.Fixed()
+        self._active_comment_layer.set_hexpand(True)
+        self._active_comment_layer.set_vexpand(True)
+        self._active_comment_layer.set_can_focus(False)
+        self._active_comment_layer.set_no_show_all(True)
+        # Keep the empty layer allocated so promotion can measure the real
+        # workspace before it has a child. Pass pointer input through until a
+        # page-adjacent comment is present.
+        self._active_comment_layer.set_visible(True)
+        _style(self._active_comment_layer, "see-docx-active-comment-layer")
         document_canvas.add_overlay(self._search_panel)
         document_canvas.add_overlay(self._export_panel)
         self._document_layout.attach(self._outline_panel, 0, 0, 1, 1)
@@ -3544,11 +4009,19 @@ class DocxWindow(Gtk.ApplicationWindow):
         self.document.widget.connect(
             "size-allocate", lambda *_args: self._layout_comments()
         )
+        self.document.widget.get_vadjustment().connect(
+            "value-changed", self._on_document_scroll_changed
+        )
         workspace.add_overlay(self._comment_line_layer)
         workspace.set_overlay_pass_through(self._comment_line_layer, True)
+        workspace.add_overlay(self._active_comment_layer)
+        workspace.set_overlay_pass_through(self._active_comment_layer, True)
         workspace.add_overlay(self._page_jump_panel)
         workspace.add_overlay(self._url_hint_layer)
         workspace.set_overlay_pass_through(self._url_hint_layer, True)
+        self._notification_revealer = self._build_notification()
+        workspace.add_overlay(self._notification_revealer)
+        workspace.set_overlay_pass_through(self._notification_revealer, True)
         status_bar = _FooterStatusBar()
         _style(status_bar, "see-docx-status")
         status_content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
@@ -3600,6 +4073,48 @@ class DocxWindow(Gtk.ApplicationWindow):
 
         self._watch_source()
         self._queue_refresh(delay=0)
+
+    def _build_notification(self) -> Gtk.Revealer:
+        """Build the transient, Zathura-style action confirmation."""
+
+        self._notification_box = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=10,
+        )
+        self._notification_box.set_can_focus(False)
+        _style(self._notification_box, "see-docx-notification")
+
+        self._notification_mark = _label("✓", xalign=0.5)
+        _style(self._notification_mark, "see-docx-notification-mark")
+        self._notification_box.pack_start(
+            self._notification_mark,
+            False,
+            False,
+            0,
+        )
+
+        copy = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        self._notification_title = _label("")
+        _style(self._notification_title, "see-docx-notification-title")
+        copy.pack_start(self._notification_title, False, False, 0)
+
+        self._notification_detail = _label("")
+        self._notification_detail.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+        self._notification_detail.set_max_width_chars(64)
+        _style(self._notification_detail, "see-docx-notification-detail")
+        copy.pack_start(self._notification_detail, False, False, 0)
+        self._notification_box.pack_start(copy, True, True, 0)
+
+        revealer = Gtk.Revealer()
+        revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_UP)
+        revealer.set_transition_duration(ACTION_NOTIFICATION_TRANSITION_MS)
+        revealer.set_reveal_child(False)
+        revealer.set_halign(Gtk.Align.CENTER)
+        revealer.set_valign(Gtk.Align.END)
+        revealer.set_margin_bottom(18)
+        revealer.add(self._notification_box)
+        revealer.show_all()
+        return revealer
 
     def _build_outline_panel(self) -> Gtk.Box:
         """Build the hidden document-heading navigator."""
@@ -3677,7 +4192,7 @@ class DocxWindow(Gtk.ApplicationWindow):
             "Comments · c focus · j/k select · Enter read · v show or hide"
         )
 
-        header = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        header = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
         _style(header, "see-docx-comments-header")
         header_top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         _style(header_top, "see-docx-comments-header-top")
@@ -3775,16 +4290,23 @@ class DocxWindow(Gtk.ApplicationWindow):
         message.pack_start(body, False, False, 0)
         return message
 
-    def _build_comment_card(self, thread: CommentThread) -> Gtk.Box:
+    def _build_comment_card(
+        self,
+        thread: CommentThread,
+        *,
+        interactive: bool = True,
+        body_height: int | None = None,
+    ) -> tuple[Gtk.Box, Gtk.ScrolledWindow]:
         """Create one selectable conversation with a single scroll surface."""
 
         bubble = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=7)
         bubble.set_hexpand(True)
-        bubble.set_can_focus(True)
-        bubble.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
-        bubble.connect(
-            "button-press-event", self._on_comment_card_press, thread.thread_id
-        )
+        bubble.set_can_focus(interactive)
+        if interactive:
+            bubble.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+            bubble.connect(
+                "button-press-event", self._on_comment_card_press, thread.thread_id
+            )
         _style(bubble, "see-docx-comment-thread")
         bubble.set_halign(Gtk.Align.FILL)
 
@@ -3818,16 +4340,18 @@ class DocxWindow(Gtk.ApplicationWindow):
         body_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         body_scroller.set_kinetic_scrolling(True)
         body_scroller.set_hexpand(True)
-        body_scroller.set_can_focus(True)
+        body_scroller.set_can_focus(interactive)
         _style(body_scroller, "see-docx-comment-body-scroll")
         body_scroller.add(conversation)
-        body_scroller.connect(
-            "size-allocate",
-            lambda *_args: GLib.idle_add(self._layout_comments_after_allocate),
-        )
-        body_scroller.connect("focus-in-event", self._on_comment_focus_in)
+        if body_height is not None:
+            body_scroller.set_size_request(-1, body_height)
+        if interactive:
+            body_scroller.connect(
+                "size-allocate",
+                lambda *_args: GLib.idle_add(self._layout_comments_after_allocate),
+            )
+            body_scroller.connect("focus-in-event", self._on_comment_focus_in)
         bubble.pack_start(body_scroller, False, False, 0)
-        self._comment_body_scrollers[thread.thread_id] = body_scroller
 
         anchor = self.document.comment_anchor_text(thread.root).strip()
         if anchor:
@@ -3840,7 +4364,7 @@ class DocxWindow(Gtk.ApplicationWindow):
             anchor_label.set_xalign(0.0)
             _style(anchor_label, "see-docx-comment-anchor")
             bubble.pack_start(anchor_label, False, False, 0)
-        return bubble
+        return bubble, body_scroller
 
     def _on_comment_focus_in(
         self, _widget: Gtk.Widget, _event: Gdk.EventFocus
@@ -3854,6 +4378,9 @@ class DocxWindow(Gtk.ApplicationWindow):
         self._update_comment_count()
         self._sync_active_comment_mark()
         self._apply_comment_sizing()
+        card = self._active_comment_visual_card()
+        if card is not None:
+            card.get_style_context().add_class("comment-body-focused")
         return False
 
     def _on_document_focus_in(
@@ -3935,12 +4462,17 @@ class DocxWindow(Gtk.ApplicationWindow):
         self._comments_panel.get_style_context().remove_class(
             "comments-body-focused"
         )
+        card = self._active_comment_visual_card()
+        if card is not None:
+            card.get_style_context().remove_class("comment-body-focused")
+        self._apply_comment_sizing()
         self._focus_active_comment_card()
 
     def _set_comments(self, comments: Iterable[DocumentComment]) -> None:
         """Replace the rail contents and reveal it only when threads exist."""
 
         was_available = self._comments_available
+        self._restore_active_comment_card()
         for card in self._comment_cards.values():
             card.destroy()
         self._comment_cards.clear()
@@ -3955,6 +4487,7 @@ class DocxWindow(Gtk.ApplicationWindow):
         if not has_comments:
             self._comments_visible = False
             self._comments_focused = False
+            self._restore_document_zoom_after_comments()
             self._comments_panel.get_style_context().remove_class(
                 "comments-focused"
             )
@@ -4000,15 +4533,325 @@ class DocxWindow(Gtk.ApplicationWindow):
         self._sync_active_comment_mark()
         self._comments_empty.set_visible(not self._comment_annotations)
         for thread in self._comment_annotations:
-            card = self._build_comment_card(thread)
+            card, body_scroller = self._build_comment_card(thread)
             self._comment_cards[thread.thread_id] = card
+            self._comment_body_scrollers[thread.thread_id] = body_scroller
             self._comments_list.pack_start(card, False, False, 0)
             card.show_all()
         self._apply_comment_sizing()
+        if self._comments_visible:
+            GLib.idle_add(self._fit_document_for_comments)
+
+    def _on_workspace_overlay_child_position(
+        self,
+        _overlay: Gtk.Overlay,
+        child: Gtk.Widget,
+        allocation: Gdk.Rectangle,
+    ) -> bool:
+        """Allocate the active comment only over its visible input region."""
+
+        geometry = self._active_comment_float_geometry
+        if child is not self._active_comment_float_card or geometry is None:
+            return False
+        allocation.x, allocation.y, allocation.width, allocation.height = geometry
+        return True
+
+    def _promote_active_comment_card(self) -> None:
+        """Ghost the rail card and create a page-adjacent copy when it fits."""
+
+        if (
+            not self._comments_focused
+            or not self._comments_visible
+            or self._active_comment_id is None
+            or (
+                self._comment_body_focused
+                and self._active_comment_float_id != self._active_comment_id
+            )
+        ):
+            return
+        if (
+            self._active_comment_float_id is not None
+            and self._active_comment_float_id != self._active_comment_id
+        ):
+            self._restore_active_comment_card()
+        card = self._comment_cards.get(self._active_comment_id)
+        if card is None:
+            return
+        if (
+            self._active_comment_float_id == self._active_comment_id
+            and self._active_comment_float_card is not None
+        ):
+            self._schedule_active_comment_position()
+            return
+
+        width = card.get_allocated_width()
+        height = card.get_allocated_height()
+        if width <= 0 or height <= 0:
+            return
+        geometry = self._comment_float_geometry_for_thread(
+            self._active_comment_id,
+            height,
+        )
+        if geometry is None:
+            return
+        thread = next(
+            (
+                candidate
+                for candidate in self._comment_annotations
+                if candidate.thread_id == self._active_comment_id
+            ),
+            None,
+        )
+        if thread is None:
+            return
+        left, top, float_width = geometry
+        body_scroller = self._comment_body_scrollers.get(self._active_comment_id)
+        body_height = (
+            body_scroller.get_allocated_height()
+            if body_scroller is not None
+            else 0
+        )
+        popout, popout_body = self._build_comment_card(
+            thread,
+            body_height=body_height if body_height > 0 else None,
+        )
+        popout.set_hexpand(False)
+        popout.set_halign(Gtk.Align.START)
+        popout.set_valign(Gtk.Align.START)
+        popout.set_size_request(float_width, height)
+        popout.get_style_context().add_class("active")
+        popout.get_style_context().add_class("active-comment-float")
+        overlay = self._active_comment_layer.get_parent()
+        if not isinstance(overlay, Gtk.Overlay):
+            popout.destroy()
+            return
+        # Mount only the card as an interactive overlay. The full-workspace
+        # fixed layer remains a passive coordinate plane; making that layer
+        # interactive blocks the PDF's cursor, wheel, and drag events even in
+        # the large empty area surrounding the card.
+        self._active_comment_float_card = popout
+        self._active_comment_float_geometry = (left, top, float_width, height)
+        overlay.add_overlay(popout)
+        overlay.set_overlay_pass_through(popout, False)
+        self._active_comment_float_body = popout_body
+        self._active_comment_float_id = self._active_comment_id
+        self._active_comment_float_height = float(height)
+        self._set_comment_card_ghost(card, True, width, height)
+        self._active_comment_layer.set_visible(True)
+        popout.show_all()
+        if self._comment_body_focused:
+            popout.get_style_context().add_class("comment-body-focused")
+            popout_body.grab_focus()
+        else:
+            popout.grab_focus()
+
+    def _set_comment_card_ghost(
+        self,
+        card: Gtk.Box,
+        ghost: bool,
+        width: int = -1,
+        height: int = -1,
+    ) -> None:
+        """Keep the rail card allocated while turning its contents into a ghost."""
+
+        style_context = card.get_style_context()
+        if ghost:
+            style_context.add_class("comment-rail-ghost")
+            card.set_size_request(width, height)
+            for child in card.get_children():
+                child.set_opacity(0.0)
+            return
+        style_context.remove_class("comment-rail-ghost")
+        card.set_size_request(-1, -1)
+        for child in card.get_children():
+            child.set_opacity(1.0)
+
+    def _comment_float_geometry_for_thread(
+        self,
+        thread_id: str,
+        card_height: float,
+    ) -> tuple[int, int, int] | None:
+        """Return popout geometry only when the page context and gutter fit."""
+
+        context = self._comment_float_context(thread_id)
+        if context is None:
+            return None
+        page_right, anchor_point = context
+        return _comment_float_geometry(
+            page_right[0],
+            self._active_comment_layer.get_allocated_width(),
+            self._active_comment_layer.get_allocated_height(),
+            anchor_point[1],
+            card_height,
+        )
+
+    def _comment_float_context(
+        self,
+        thread_id: str,
+    ) -> tuple[tuple[float, float], tuple[float, float]] | None:
+        """Translate an anchored or visible-page context into workspace space."""
+
+        canvas_width = self._active_comment_layer.get_allocated_width()
+        canvas_height = self._active_comment_layer.get_allocated_height()
+        if canvas_width <= 0 or canvas_height <= 0:
+            return None
+        anchor = self._comment_anchor_by_id.get(thread_id)
+        if anchor is not None and 0 <= anchor.page_index < len(self.document._pages):
+            page = self.document._pages[anchor.page_index]
+            page_right = self._translated_point(
+                page,
+                self._active_comment_layer,
+                page.get_allocated_width(),
+                anchor.center_y * page._zoom,
+            )
+            anchor_point = self._translated_point(
+                page,
+                self._active_comment_layer,
+                anchor.right * page._zoom + 3,
+                anchor.center_y * page._zoom,
+            )
+        else:
+            page_right, anchor_point = self._visible_page_float_context()
+        if page_right is None or anchor_point is None:
+            return None
+        if (
+            page_right[0] < 0
+            or page_right[0] > canvas_width
+            or anchor_point[1] < 0
+            or anchor_point[1] > canvas_height
+        ):
+            return None
+        return page_right, anchor_point
+
+    def _restore_active_comment_card(self) -> None:
+        """Remove the popout and restore the original rail card contents."""
+
+        if self._active_comment_float_id is None:
+            return
+        thread_id = self._active_comment_float_id
+        card = self._comment_cards.get(thread_id)
+        if self._active_comment_float_card is not None:
+            popout = self._active_comment_float_card
+            parent = popout.get_parent()
+            if isinstance(parent, Gtk.Container):
+                parent.remove(popout)
+            popout.destroy()
+        if card is not None:
+            self._set_comment_card_ghost(card, False)
+            card.get_style_context().remove_class("comment-body-focused")
+        self._active_comment_float_card = None
+        self._active_comment_float_body = None
+        self._active_comment_float_id = None
+        self._active_comment_float_height = 0.0
+        self._active_comment_float_geometry = None
+        if self._active_comment_position_source:
+            GLib.source_remove(self._active_comment_position_source)
+            self._active_comment_position_source = 0
+
+    def _schedule_active_comment_position(self) -> None:
+        """Retry placement after GTK commits scroll and allocation changes."""
+
+        if (
+            self._active_comment_float_id is not None
+            and not self._active_comment_position_source
+        ):
+            self._active_comment_position_source = GLib.idle_add(
+                self._position_active_comment
+            )
+
+    def _visible_page_float_context(
+        self,
+    ) -> tuple[
+        tuple[float, float] | None,
+        tuple[float, float] | None,
+    ]:
+        """Return a stable page edge for a comment without a source range."""
+
+        canvas_height = self._active_comment_layer.get_allocated_height()
+        viewport_center = canvas_height / 2
+        nearest: tuple[float, float, float] | None = None
+        for page in self.document._pages:
+            top = self._translated_point(
+                page, self._active_comment_layer, 0, 0
+            )
+            bottom = self._translated_point(
+                page,
+                self._active_comment_layer,
+                0,
+                page.get_allocated_height(),
+            )
+            right = self._translated_point(
+                page,
+                self._active_comment_layer,
+                page.get_allocated_width(),
+                page.get_allocated_height() / 2,
+            )
+            if top is None or bottom is None or right is None:
+                continue
+            page_top = min(top[1], bottom[1])
+            page_bottom = max(top[1], bottom[1])
+            page_y = min(max(viewport_center, page_top), page_bottom)
+            distance = abs(viewport_center - page_y)
+            if nearest is None or distance < nearest[0]:
+                nearest = (distance, right[0], page_y)
+        if nearest is None:
+            return None, None
+        _distance, page_right, anchor_y = nearest
+        context = (page_right, anchor_y)
+        return context, context
+
+    def _position_active_comment(self) -> bool:
+        """Place the promoted thread beside the rendered page, if it fits."""
+
+        self._active_comment_position_source = 0
+        if self._active_comment_float_id is None:
+            return GLib.SOURCE_REMOVE
+        card = self._active_comment_float_card
+        if card is None:
+            return GLib.SOURCE_REMOVE
+        context = self._comment_float_context(self._active_comment_float_id)
+        if context is None:
+            self._restore_active_comment_card()
+            return GLib.SOURCE_REMOVE
+        page_right, anchor_point = context
+        geometry = _comment_float_geometry(
+            page_right[0],
+            self._active_comment_layer.get_allocated_width(),
+            self._active_comment_layer.get_allocated_height(),
+            anchor_point[1],
+            self._active_comment_float_height,
+        )
+        if geometry is None:
+            self._restore_active_comment_card()
+            return GLib.SOURCE_REMOVE
+        left, top, width = geometry
+        self._active_comment_float_geometry = (
+            left,
+            top,
+            width,
+            round(self._active_comment_float_height),
+        )
+        card.set_size_request(width, round(self._active_comment_float_height))
+        parent = card.get_parent()
+        if isinstance(parent, Gtk.Overlay):
+            parent.queue_resize()
+        card.show_all()
+        return GLib.SOURCE_REMOVE
 
     def _apply_comment_sizing(self) -> None:
         """Apply the active width instantly, growing only toward the left."""
 
+        should_float = (
+            self._comments_focused
+            and self._comments_visible
+            and self._active_comment_id is not None
+            and (
+                not self._comment_body_focused
+                or self._active_comment_float_id == self._active_comment_id
+            )
+        )
+        if not should_float:
+            self._restore_active_comment_card()
         for thread in self._comment_annotations:
             card = self._comment_cards.get(thread.thread_id)
             if card is None:
@@ -4017,13 +4860,14 @@ class DocxWindow(Gtk.ApplicationWindow):
                 self._comments_focused
                 and thread.thread_id == self._active_comment_id
             )
-            card.set_margin_start(
-                0
-                if active
-                else COMMENT_INACTIVE_CARD_INSET
-            )
+            card.set_margin_start(0 if active else COMMENT_INACTIVE_CARD_INSET)
             card.set_margin_end(0)
         self._layout_comments()
+        if should_float:
+            # Let GTK commit the active card's rail allocation first. The
+            # ghost then captures the exact dimensions of the card that stays
+            # in the list while its duplicate is positioned beside the page.
+            GLib.idle_add(self._promote_active_comment_card)
 
     def _on_comment_card_press(
         self, _card: Gtk.Box, event: Gdk.EventButton, thread_id: str
@@ -4062,7 +4906,7 @@ class DocxWindow(Gtk.ApplicationWindow):
             GLib.idle_add(self._focus_active_comment_card)
 
     def _focus_active_comment_card(self) -> bool:
-        """Keep keyboard focus on the selected card in the comment list."""
+        """Keep keyboard focus on the selected card wherever it is displayed."""
 
         if (
             not self._comments_focused
@@ -4070,23 +4914,47 @@ class DocxWindow(Gtk.ApplicationWindow):
             or self._active_comment_id is None
         ):
             return GLib.SOURCE_REMOVE
-        card = self._comment_cards.get(self._active_comment_id)
+        card = self._active_comment_visual_card()
         if card is not None:
             card.grab_focus()
         return GLib.SOURCE_REMOVE
+
+    def _active_comment_visual_card(self) -> Gtk.Box | None:
+        """Return the active thread representation currently shown to the user."""
+
+        if (
+            self._active_comment_float_id == self._active_comment_id
+            and self._active_comment_float_card is not None
+        ):
+            return self._active_comment_float_card
+        return self._comment_cards.get(self._active_comment_id)
+
+    def _active_comment_visual_body(self) -> Gtk.ScrolledWindow | None:
+        """Return the body belonging to the currently shown thread card."""
+
+        if (
+            self._active_comment_float_id == self._active_comment_id
+            and self._active_comment_float_body is not None
+        ):
+            return self._active_comment_float_body
+        return self._comment_body_scrollers.get(self._active_comment_id)
 
     def _enter_comment_body(self) -> None:
         """Enter text scrolling for the currently selected comment."""
 
         if not self._comments_focused or self._active_comment_id is None:
             return
-        body = self._comment_body_scrollers.get(self._active_comment_id)
+        body = self._active_comment_visual_body()
         if body is None:
             return
         self._comment_body_focused = True
+        self._apply_comment_sizing()
         self._comments_panel.get_style_context().add_class(
             "comments-body-focused"
         )
+        card = self._active_comment_visual_card()
+        if card is not None:
+            card.get_style_context().add_class("comment-body-focused")
         body.grab_focus()
 
     def _move_comment_selection(self, direction: int) -> None:
@@ -4141,7 +5009,7 @@ class DocxWindow(Gtk.ApplicationWindow):
             or self._active_comment_id is None
         ):
             return None
-        body = self._comment_body_scrollers.get(self._active_comment_id)
+        body = self._active_comment_visual_body()
         if body is None or not body.is_focus():
             return None
         return body
@@ -4196,7 +5064,23 @@ class DocxWindow(Gtk.ApplicationWindow):
         """Retry once GTK has committed the page stack's final coordinates."""
 
         self._layout_comments()
+        if getattr(self, "_active_comment_float_id", None) is not None:
+            self._schedule_active_comment_position()
+        elif getattr(self, "_comments_focused", False) and not getattr(
+            self, "_comment_body_focused", False
+        ):
+            GLib.idle_add(self._promote_active_comment_card)
         return GLib.SOURCE_REMOVE
+
+    def _on_document_scroll_changed(self, _adjustment: Gtk.Adjustment) -> None:
+        """Retry a rail fallback when scrolling brings its source back on screen."""
+
+        if self._comments_focused and not self._comment_body_focused:
+            if self._active_comment_float_id is not None:
+                self._schedule_active_comment_position()
+            else:
+                GLib.idle_add(self._promote_active_comment_card)
+        self._comment_line_layer.queue_draw()
 
     def _layout_comments(self) -> None:
         """Refresh responsive card sizing and the active connector."""
@@ -4258,6 +5142,8 @@ class DocxWindow(Gtk.ApplicationWindow):
             self._comments_panel.set_size_request(width, -1)
         if current != width:
             GLib.idle_add(self._layout_comments_after_allocate)
+        if self._comments_visible:
+            GLib.idle_add(self._fit_document_for_comments)
 
     def _draw_comment_connectors(
         self, _layer: Gtk.DrawingArea, context: object
@@ -4277,8 +5163,18 @@ class DocxWindow(Gtk.ApplicationWindow):
             if thread.thread_id != active_id:
                 continue
             card = self._comment_cards.get(thread.thread_id)
+            connector_card = (
+                self._active_comment_float_card
+                if self._active_comment_float_id == thread.thread_id
+                else card
+            )
             anchor = self._comment_anchor_by_id.get(thread.thread_id)
-            if card is None or anchor is None or not card.get_visible():
+            if (
+                card is None
+                or connector_card is None
+                or anchor is None
+                or not connector_card.get_visible()
+            ):
                 continue
             if not 0 <= anchor.page_index < len(self.document._pages):
                 continue
@@ -4290,10 +5186,10 @@ class DocxWindow(Gtk.ApplicationWindow):
                 anchor.center_y * page._zoom,
             )
             card_point = self._translated_point(
-                card,
+                connector_card,
                 self._comment_line_layer,
                 0,
-                card.get_allocated_height() / 2,
+                connector_card.get_allocated_height() / 2,
             )
             if start is None or card_point is None:
                 continue
@@ -4623,6 +5519,48 @@ class DocxWindow(Gtk.ApplicationWindow):
         self._outline_tree.grab_focus()
         self._outline_fit_source = GLib.idle_add(self._fit_document_to_outline)
 
+    def _fit_document_for_comments(self) -> bool:
+        """Fit the page width whenever the visible comment rail needs it."""
+
+        if (
+            not getattr(self, "get_visible", lambda: True)()
+            or not hasattr(self.document, "widget")
+            or not self._comments_visible
+            or not self._comments_available
+            or not self.document.has_document
+        ):
+            return GLib.SOURCE_REMOVE
+        adjustment = self.document.widget.get_vadjustment()
+        if adjustment is None:
+            return GLib.SOURCE_REMOVE
+        if self._comments_zoom_before_fit is None:
+            self._comments_zoom_before_fit = self.document.zoom
+        if (
+            self._comments_auto_fit_zoom is None
+            or abs(self.document.zoom - self._comments_auto_fit_zoom) < 0.001
+        ):
+            self.document.fit_to_width()
+            self._comments_auto_fit_zoom = self.document.zoom
+        if getattr(self, "_active_comment_float_id", None) is not None:
+            self._schedule_active_comment_position()
+        elif getattr(self, "_comments_focused", False) and not getattr(
+            self, "_comment_body_focused", False
+        ):
+            GLib.idle_add(self._promote_active_comment_card)
+        return GLib.SOURCE_REMOVE
+
+    def _restore_document_zoom_after_comments(self) -> None:
+        """Restore the pre-rail zoom unless the user changed it manually."""
+
+        previous = self._comments_zoom_before_fit
+        auto_fit = self._comments_auto_fit_zoom
+        self._comments_zoom_before_fit = None
+        self._comments_auto_fit_zoom = None
+        if previous is None:
+            return
+        if auto_fit is None or abs(self.document.zoom - auto_fit) < 0.001:
+            self.document.set_zoom(previous)
+
     def _toggle_comments(self) -> None:
         """Slide the annotation rail away while leaving the document intact."""
 
@@ -4633,10 +5571,12 @@ class DocxWindow(Gtk.ApplicationWindow):
         self._comment_line_layer.set_visible(self._comments_visible)
         if self._comments_visible:
             self._apply_comment_sizing()
+            GLib.idle_add(self._fit_document_for_comments)
             if self._comments_focused:
                 GLib.idle_add(self._scroll_active_comment_into_view)
         else:
             self._blur_comments()
+            self._restore_document_zoom_after_comments()
 
     def _fit_document_to_outline(self) -> bool:
         """Fit the PDF after GTK assigns the document column its new width."""
@@ -4696,8 +5636,7 @@ class DocxWindow(Gtk.ApplicationWindow):
         """Open or dismiss the export format chooser."""
 
         if self._export_panel.get_visible():
-            self._export_panel.hide()
-            self.document.widget.grab_focus()
+            self._close_export()
             return
         if self._search_panel.get_visible():
             self._search_panel.hide()
@@ -4709,6 +5648,12 @@ class DocxWindow(Gtk.ApplicationWindow):
         self._export_panel.set_no_show_all(False)
         self._export_panel.show_all()
         self._export_panel.set_no_show_all(True)
+
+    def _close_export(self) -> None:
+        """Dismiss the export chooser and return focus to the document."""
+
+        self._export_panel.hide()
+        self.document.widget.grab_focus()
 
     def _move_export_selection(self, direction: int) -> None:
         """Move the active export target, wrapping for future formats."""
@@ -4734,6 +5679,8 @@ class DocxWindow(Gtk.ApplicationWindow):
             self._choose_pdf_destination()
         elif EXPORT_FORMATS[self._export_index] == "Plain text":
             self._choose_plain_text_destination()
+        elif EXPORT_FORMATS[self._export_index] == "Markdown":
+            self._choose_markdown_destination()
 
     def _choose_pdf_destination(self) -> None:
         """Ask where the PDF should be saved, with safe overwrite handling."""
@@ -4761,6 +5708,19 @@ class DocxWindow(Gtk.ApplicationWindow):
             start_export=self._start_plain_text_export,
         )
 
+    def _choose_markdown_destination(self) -> None:
+        """Ask where the Pandoc Markdown export should be saved."""
+
+        self._choose_export_destination(
+            title="Export Markdown",
+            filename=f"{self.path.stem}.md",
+            filter_name="Markdown documents",
+            mime_type="text/markdown",
+            pattern="*.md",
+            export_path=_markdown_export_path,
+            start_export=self._start_markdown_export,
+        )
+
     def _choose_export_destination(
         self,
         *,
@@ -4770,7 +5730,7 @@ class DocxWindow(Gtk.ApplicationWindow):
         mime_type: str,
         pattern: str,
         export_path: Callable[[Path], Path],
-        start_export: Callable[[Path], None],
+        start_export: Callable[[Path], bool],
     ) -> None:
         """Prompt for an export destination and apply its expected suffix."""
 
@@ -4798,14 +5758,15 @@ class DocxWindow(Gtk.ApplicationWindow):
         if response != Gtk.ResponseType.ACCEPT or filename is None:
             self._export_status.set_text("Export cancelled.")
             return
-        start_export(export_path(Path(filename)))
+        if start_export(export_path(Path(filename))):
+            self._close_export()
 
-    def _start_pdf_export(self, destination: Path) -> None:
+    def _start_pdf_export(self, destination: Path) -> bool:
         """Run the PDF conversion without blocking the document viewer."""
 
         if not destination.parent.is_dir():
             self._export_status.set_text("The selected export folder no longer exists.")
-            return
+            return False
         converter = LibreOfficeConverter()
         try:
             paths = converter.prepare(self.path, revision=1)
@@ -4816,7 +5777,7 @@ class DocxWindow(Gtk.ApplicationWindow):
         except (ConversionError, GLib.Error, OSError) as error:
             converter.close()
             self._export_status.set_text(f"PDF export failed: {error}")
-            return
+            return False
 
         self._export_converter = converter
         self._export_process = process
@@ -4824,6 +5785,7 @@ class DocxWindow(Gtk.ApplicationWindow):
         self._export_destination = destination
         self._export_status.set_text("Exporting PDF…")
         process.communicate_utf8_async(None, None, self._on_pdf_export_finished, None)
+        return True
 
     def _on_pdf_export_finished(
         self,
@@ -4859,13 +5821,27 @@ class DocxWindow(Gtk.ApplicationWindow):
         finally:
             converter.close()
 
-    def _start_plain_text_export(self, destination: Path) -> None:
-        """Run the Pandoc conversion without blocking the document viewer."""
+    def _start_plain_text_export(self, destination: Path) -> bool:
+        """Start a plain-text Pandoc export."""
+
+        return self._start_pandoc_export(destination, PandocConverter())
+
+    def _start_markdown_export(self, destination: Path) -> bool:
+        """Start a native Pandoc Markdown export."""
+
+        return self._start_pandoc_export(destination, PandocConverter.markdown())
+
+    def _start_pandoc_export(
+        self,
+        destination: Path,
+        converter: PandocConverter,
+    ) -> bool:
+        """Run one Pandoc text conversion without blocking the viewer."""
 
         if not destination.parent.is_dir():
+            converter.close()
             self._export_status.set_text("The selected export folder no longer exists.")
-            return
-        converter = PandocConverter()
+            return False
         try:
             paths = converter.prepare(self.path, revision=1)
             process = Gio.Subprocess.new(
@@ -4874,19 +5850,24 @@ class DocxWindow(Gtk.ApplicationWindow):
             )
         except (ConversionError, GLib.Error, OSError) as error:
             converter.close()
-            self._export_status.set_text(f"Plain-text export failed: {error}")
-            return
+            self._export_status.set_text(
+                f"{converter.display_name} export failed: {error}"
+            )
+            return False
 
         self._export_converter = converter
         self._export_process = process
         self._export_paths = paths
         self._export_destination = destination
-        self._export_status.set_text("Exporting plain text…")
-        process.communicate_utf8_async(
-            None, None, self._on_plain_text_export_finished, None
+        self._export_status.set_text(
+            f"Exporting {converter.display_name.lower()}…"
         )
+        process.communicate_utf8_async(
+            None, None, self._on_pandoc_export_finished, None
+        )
+        return True
 
-    def _on_plain_text_export_finished(
+    def _on_pandoc_export_finished(
         self,
         process: Gio.Subprocess,
         result: Gio.AsyncResult,
@@ -4908,16 +5889,18 @@ class DocxWindow(Gtk.ApplicationWindow):
 
         try:
             _communicated, stdout, stderr = process.communicate_utf8_finish(result)
-            text = converter.validate(
+            output = converter.validate(
                 paths,
                 returncode=process.get_exit_status(),
                 stdout=stdout,
                 stderr=stderr,
             )
-            converter.save_text(text, destination)
+            converter.save_output(output, destination)
         except (ConversionError, GLib.Error, OSError) as error:
             if not self._closed:
-                self._export_status.set_text(f"Plain-text export failed: {error}")
+                self._export_status.set_text(
+                    f"{converter.display_name} export failed: {error}"
+                )
         else:
             if not self._closed:
                 self._export_status.set_text(f"Saved {_compact_path(destination)}")
@@ -5439,15 +6422,105 @@ class DocxWindow(Gtk.ApplicationWindow):
     def _reset_zoom(self) -> None:
         self.document.set_zoom(DEFAULT_ZOOM)
 
+    def _on_window_size_allocate(
+        self,
+        _widget: Gtk.Widget,
+        allocation: Gdk.Rectangle,
+    ) -> None:
+        """Keep the page-to-window width ratio stable across every resize."""
+
+        width = int(allocation.width)
+        previous_width = self._viewport_resize_width
+        self._viewport_resize_width = width
+        if (
+            previous_width <= 0
+            or width <= 0
+            or width == previous_width
+            or not self.document.has_document
+        ):
+            return
+
+        previous_zoom = self.document.zoom
+        comments_were_auto_fitted = (
+            self._comments_auto_fit_zoom is not None
+            and abs(previous_zoom - self._comments_auto_fit_zoom) < 0.001
+        )
+        if self._comments_zoom_before_fit is not None:
+            self._comments_zoom_before_fit = _zoom_for_resized_width(
+                self._comments_zoom_before_fit,
+                previous_width,
+                width,
+            )
+        if self._outline_zoom_before_open is not None:
+            self._outline_zoom_before_open = _zoom_for_resized_width(
+                self._outline_zoom_before_open,
+                previous_width,
+                width,
+            )
+
+        self.document.set_zoom(
+            _zoom_for_resized_width(previous_zoom, previous_width, width),
+            minimum=MIN_FIT_ZOOM,
+            maximum=None,
+        )
+        if comments_were_auto_fitted:
+            self._comments_auto_fit_zoom = self.document.zoom
+
     def _copy_path(self) -> None:
         """Copy the resolved local DOCX path to the regular clipboard."""
 
         Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(str(self.path), -1)
+        self._show_notification("Path copied", _compact_path(self.path))
 
     def _copy_all_text(self) -> None:
         """Copy the full document while preserving its original paragraphs."""
 
-        self.document.copy_all_text()
+        if self.document.copy_all_text():
+            self._show_notification(
+                "Document text copied",
+                "The full document is ready to paste",
+            )
+        else:
+            self._show_notification(
+                "Nothing to copy",
+                "Document text is not available yet",
+                success=False,
+            )
+
+    def _show_notification(
+        self,
+        title: str,
+        detail: str = "",
+        *,
+        success: bool = True,
+    ) -> None:
+        """Show one action result and restart its dismissal timer."""
+
+        if self._notification_source:
+            GLib.source_remove(self._notification_source)
+            self._notification_source = 0
+
+        context = self._notification_box.get_style_context()
+        if success:
+            context.remove_class("warning")
+        else:
+            context.add_class("warning")
+        self._notification_mark.set_text("✓" if success else "!")
+        self._notification_title.set_text(title)
+        self._notification_detail.set_text(detail)
+        self._notification_detail.set_visible(bool(detail))
+        self._notification_revealer.set_reveal_child(True)
+        self._notification_source = GLib.timeout_add(
+            ACTION_NOTIFICATION_DURATION_MS,
+            self._hide_notification,
+        )
+
+    def _hide_notification(self) -> bool:
+        """Dismiss the current action notification after its dwell."""
+
+        self._notification_source = 0
+        self._notification_revealer.set_reveal_child(False)
+        return GLib.SOURCE_REMOVE
 
     def _open_in_writer(self) -> None:
         """Hand the current source DOCX to Writer on this Hyprland workspace."""
@@ -5780,6 +6853,9 @@ class DocxWindow(Gtk.ApplicationWindow):
         if self._reading_progress_source:
             GLib.source_remove(self._reading_progress_source)
             self._reading_progress_source = 0
+        if self._notification_source:
+            GLib.source_remove(self._notification_source)
+            self._notification_source = 0
         if self._debounce_source:
             GLib.source_remove(self._debounce_source)
             self._debounce_source = 0

@@ -25,11 +25,11 @@ class ConversionPaths:
 
 @dataclass(frozen=True)
 class PandocConversionPaths:
-    """Private working paths for one Pandoc plain-text export."""
+    """Private working paths for one Pandoc text-format export."""
 
     root: Path
     source_copy: Path
-    text: Path
+    output: Path
 
 
 def _copy_stable_source(source: Path, destination: Path) -> None:
@@ -170,27 +170,54 @@ class LibreOfficeConverter:
 
 
 class PandocConverter:
-    """Export a stable DOCX snapshot as plain text through Pandoc."""
+    """Export a stable DOCX snapshot to a Pandoc-supported text format."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        writer: str = "plain",
+        output_suffix: str = ".txt",
+        display_name: str = "Plain text",
+        writer_options: tuple[str, ...] = (),
+    ) -> None:
         self._root = Path(tempfile.mkdtemp(prefix="see-docx-pandoc-"))
+        self._writer = writer
+        self._output_suffix = output_suffix
+        self._display_name = display_name
+        self._writer_options = writer_options
+
+    @classmethod
+    def markdown(cls) -> PandocConverter:
+        """Use Pandoc's Markdown writer with hash-prefixed heading levels."""
+
+        return cls(
+            writer="markdown",
+            output_suffix=".md",
+            display_name="Markdown",
+            writer_options=("--markdown-headings=atx",),
+        )
+
+    @property
+    def display_name(self) -> str:
+        return self._display_name
 
     def paths_for(self, revision: int) -> PandocConversionPaths:
         root = self._root / f"export-{revision:06d}"
         return PandocConversionPaths(
             root=root,
             source_copy=root / "source.docx",
-            text=root / "source.txt",
+            output=root / f"source{self._output_suffix}",
         )
 
-    @staticmethod
-    def command(paths: PandocConversionPaths) -> list[str]:
+    def command(self, paths: PandocConversionPaths) -> list[str]:
         return [
             "pandoc",
             "--from=docx",
-            "--to=plain",
+            f"--to={self._writer}",
+            "--wrap=none",
+            *self._writer_options,
             "--output",
-            str(paths.text),
+            str(paths.output),
             str(paths.source_copy),
         ]
 
@@ -202,25 +229,27 @@ class PandocConverter:
         _copy_stable_source(source, paths.source_copy)
         return paths
 
-    @staticmethod
     def validate(
+        self,
         paths: PandocConversionPaths,
         *,
         returncode: int,
         stdout: str | None = None,
         stderr: str | None = None,
     ) -> Path:
-        if returncode != 0 or not paths.text.is_file():
+        if returncode != 0 or not paths.output.is_file():
             details = (stderr or stdout or "").strip()
             suffix = f"\n{details}" if details else ""
-            raise ConversionError(f"Pandoc could not export this DOCX as plain text.{suffix}")
-        return paths.text
+            raise ConversionError(
+                f"Pandoc could not export this DOCX as "
+                f"{self._display_name.lower()}.{suffix}"
+            )
+        return paths.output
 
-    @staticmethod
-    def save_text(text: Path, destination: Path) -> Path:
-        """Atomically publish a completed plain-text export."""
+    def save_output(self, output: Path, destination: Path) -> Path:
+        """Atomically publish a completed Pandoc export."""
 
-        return _save_output(text, destination, suffix=".txt")
+        return _save_output(output, destination, suffix=self._output_suffix)
 
     def close(self) -> None:
         shutil.rmtree(self._root, ignore_errors=True)

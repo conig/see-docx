@@ -9,6 +9,160 @@ from see_docx.viewer import PdfDocumentView, PdfPage, TextSelection, _text_selec
 
 
 class TextSelectionTests(unittest.TestCase):
+    @staticmethod
+    def _selection_page(
+        lines: tuple[tuple[str, float, str], ...], allocation_y: float
+    ) -> PdfPage:
+        """Build one laid-out PDF page with semantic header/body/footer glyphs."""
+
+        text_parts: list[str] = []
+        rectangles: list[SimpleNamespace] = []
+        selection_flows: dict[int, str] = {}
+        for line_index, (line, y, flow) in enumerate(lines):
+            if line_index:
+                text_parts.append("\n")
+                rectangles.append(SimpleNamespace(x1=0.0, y1=y, x2=0.0, y2=y))
+            for character_index, character in enumerate(line):
+                index = sum(len(part) for part in text_parts)
+                text_parts.append(character)
+                rectangles.append(
+                    SimpleNamespace(
+                        x1=character_index * 5.0,
+                        y1=y,
+                        x2=(character_index + 1) * 5.0,
+                        y2=y + 4.0,
+                    )
+                )
+                selection_flows[index] = flow
+
+        text = "".join(text_parts)
+        poppler_page = Mock()
+        poppler_page.get_text.return_value = text
+        poppler_page.get_text_layout.return_value = (True, rectangles)
+        page = PdfPage.__new__(PdfPage)
+        page._page = poppler_page
+        page._width = 200.0
+        page._height = 200.0
+        page._zoom = 1.0
+        page._text_selection = None
+        page._text_selection_start = None
+        page._text_selection_end = None
+        page._selection_flow_map = selection_flows
+        page._source_character_map = {}
+        page._copy_selection = Mock()
+        page.queue_draw = Mock()
+        page.get_allocation = Mock(
+            return_value=SimpleNamespace(
+                x=0.0,
+                y=allocation_y,
+                width=200.0,
+                height=200.0,
+            )
+        )
+        return page
+
+    @staticmethod
+    def _selection_view(pages: list[PdfPage]) -> PdfDocumentView:
+        view = PdfDocumentView.__new__(PdfDocumentView)
+        view._pages = pages
+        view._rich_source = None
+        view._source_text = None
+        view._selection_anchor = None
+        view._selection_endpoint = None
+        view._selection_anchor_page = None
+        view._selection_drag_active = False
+        view._selection_auto_scroll_source = 0
+        view._selection_auto_scroll_page = None
+        view._selection_auto_scroll_point = None
+        return view
+
+    def test_body_selection_crosses_pages_without_headers_or_footers(self) -> None:
+        # A document drag may span body text on adjacent pages, but repeated
+        # running matter between those endpoints is not part of the main flow.
+        first = self._selection_page(
+            (
+                ("HEADER ONE", 10.0, "header"),
+                ("Body first", 80.0, "main"),
+                ("FOOTER ONE", 150.0, "footer"),
+            ),
+            0.0,
+        )
+        second = self._selection_page(
+            (
+                ("HEADER TWO", 10.0, "header"),
+                ("Body second", 80.0, "main"),
+                ("FOOTER TWO", 150.0, "footer"),
+            ),
+            228.0,
+        )
+        view = self._selection_view([first, second])
+
+        view._on_page_selection_event("begin", first, (0.0, 82.0))
+        view._on_page_selection_event("end", second, (55.0, 82.0))
+
+        first._copy_selection.assert_called_once_with("Body first\nBody second")
+
+    def test_header_and_footer_selections_cannot_escape_their_starting_flow(
+        self,
+    ) -> None:
+        # Header/footer text is independently selectable, but neither flow may
+        # grow into body text or continue onto another page.
+        for flow, start_y, expected in (
+            ("header", 12.0, "HEADER ONE"),
+            ("footer", 152.0, "FOOTER ONE"),
+        ):
+            with self.subTest(flow=flow):
+                first = self._selection_page(
+                    (
+                        ("HEADER ONE", 10.0, "header"),
+                        ("Body first", 80.0, "main"),
+                        ("FOOTER ONE", 150.0, "footer"),
+                    ),
+                    0.0,
+                )
+                second = self._selection_page(
+                    (
+                        ("HEADER TWO", 10.0, "header"),
+                        ("Body second", 80.0, "main"),
+                        ("FOOTER TWO", 150.0, "footer"),
+                    ),
+                    228.0,
+                )
+                view = self._selection_view([first, second])
+
+                view._on_page_selection_event("begin", first, (0.0, start_y))
+                view._on_page_selection_event("end", second, (55.0, 82.0))
+
+                first._copy_selection.assert_called_once_with(expected)
+
+    def test_dynamic_page_number_stays_in_its_static_header_flow(self) -> None:
+        # OOXML stores a cached PAGE result (for example, "1"), while each
+        # rendered page has a different number. Static story text must locate
+        # the line and classify the dynamic glyph beside it as header text.
+        text = "Page 2\nBody text"
+        rectangles = [
+            SimpleNamespace(
+                x1=index * 5.0,
+                y1=10.0 if index < 6 else 80.0,
+                x2=(index + 1) * 5.0,
+                y2=14.0 if index < 6 else 84.0,
+            )
+            for index in range(len(text))
+        ]
+
+        flow_map = viewer._rendered_selection_flow_map(
+            text,
+            rectangles,
+            200.0,
+            {"header": ("Page 1", "Page ")},
+        )
+
+        self.assertEqual(
+            {flow_map[index] for index in range(len("Page 2"))},
+            {"header"},
+        )
+        self.assertNotIn(len("Page 2\n"), flow_map)
+
     def test_copy_all_text_prefers_paragraph_preserving_docx_source(self) -> None:
         page = SimpleNamespace(_copy_selection=Mock())
         view = PdfDocumentView.__new__(PdfDocumentView)

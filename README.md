@@ -65,7 +65,7 @@ see-docx path/to/output.docx
 | `n` / `N` | Next / previous result while a committed search remains active |
 | `a` | Copy the complete document, preserving rich text and tables |
 | `y` | Copy the resolved local DOCX path to the clipboard |
-| `e`, then `j` / `k` / `Enter` | Open the export tool, choose PDF or plain text, then select its destination |
+| `e`, then `j` / `k` / `Enter` | Open the export tool, choose PDF, plain text, or Markdown, then select its destination |
 | Drag across PDF text | Highlight selected glyphs and copy formatted text or table cells immediately to the regular and primary clipboards |
 | `f`, then a displayed home-row hint | Open a visible URL with its default desktop application |
 | `:number` | Jump directly to one-based page `number` |
@@ -76,9 +76,15 @@ see-docx path/to/output.docx
 The bottom bar shows the resolved document path and current page/total. The
 complete document remains scrollable, with every page visible as a separate
 sheet above the same background; use the keyboard shortcuts above for page
-navigation, zoom, outline navigation, and refresh. The outline comes from
+navigation, zoom, outline navigation, and refresh. Resizing the window scales
+the current zoom proportionally in either direction, keeping the same balance
+between the page width and its surrounding canvas. The outline comes from
 headings exported in the DOCX/PDF; use Word heading styles when a document has
 no visible outline.
+Copying the document path or complete document text shows a compact in-app
+confirmation above the bottom bar. Repeated actions replace and reset the same
+notification, so confirmations stay visible without accumulating over the
+document.
 It initially expands only as many whole heading levels as will keep the visible
 list below 10 entries; use `l` to reveal deeper structure.
 Its relative `j` / `k` offsets use a fixed gutter, like Neovim relative line
@@ -96,8 +102,15 @@ followed by indented replies in a single scrollable conversation. Its summary
 distinguishes threads from total messages. Each thread shows the author,
 messages, and a short quote of the root's attached source text; the quote is
 marked on the rendered page and the active thread is connected to its bubble
-with an accent line. Press `c` to focus the rail without changing the selected
-thread. In the thread list, `j` / `k` select the next / previous thread and
+with an accent line. Selecting a thread with `j` / `k` centres its attached
+source text when it has a rendered anchor, including when that text is on
+another page. A thread without a source range floats beside the currently
+visible page without a misleading connector. When there is enough room, the
+original rail card stays in place as an exact-size dashed ghost while an
+interactive copy floats beside the page; when there is not enough room,
+both the original card and rail layout remain unchanged. Press `c` to focus
+the rail without changing the selected thread. In the
+thread list, `j` / `k` select the next / previous thread and
 stop at the ends; `gg` and `G` jump to the first / last thread. `Ctrl+d` /
 `Ctrl+u` scroll the full list by half a viewport. Press `Enter` on the selected
 thread to focus its conversation body; `j` / `k` scroll it line by line and
@@ -111,6 +124,16 @@ to slide the rail away when you want a wider reading canvas.
 Comment-linked text uses a dimmed variant accent as context and switches to a
 high-contrast accent wash and underline only for the focused comment; the
 variant highlight role remains reserved for the dark comment rail surfaces.
+When the rail has keyboard focus, its selected thread is promoted into a
+compact bubble beside the relevant page while its original card becomes the
+reserved ghost. Pressing `Enter` focuses and scrolls the conversation wherever
+it is currently displayed, without moving a popped-out thread back into the
+rail. If the page or anchor is outside the document viewport, or the gutter is
+too narrow, no ghost or duplicate is created and the thread stays fully
+readable in the rail.
+Revealing the rail fits the page width into the remaining document column by
+zooming out only when necessary; hiding it restores the previous zoom unless
+the user changed zoom manually.
 The search prompt appears centered over the document page as one command bar:
 `/` marks the mode, the query fills the bar, and `current of total` appears at
 the end. After `Enter`, that state becomes a smaller bottom-centre readout,
@@ -122,16 +145,22 @@ tick. The active text-search result remains highlighted in the PDF while you
 move through matches, using the current SC1GTK variant's accent and highlight
 colours. Pressing `Esc` cancels that search session: it clears the highlight and
 result list, so `n` / `N` no longer navigate until a new search.
-Pointer text selections continue across page breaks and copy all intersected
-pages as one clipboard value. The DOCX source restores formatting and table
-structure for Writer-compatible HTML paste, while plain text remains available
-for other applications; a selected table cell is copied as a cell rather than
-its visual PDF row. Keep holding the mouse button to use the wheel, or drag
-above or below a page to auto-scroll while extending the selection.
-Press `e` to open the export tool. Choose PDF or plain text with `j` / `k` and
-`Enter`, then select a destination in the save dialog. PDF uses an isolated
-LibreOffice profile; plain text is exported by Pandoc. Both replace the final
-file only after a successful conversion.
+Pointer text selections continue across page breaks through the main document
+text and copy all intersected body text as one clipboard value, without passing
+through repeated headers or footers. A selection that begins in a header or
+footer remains confined to that region on its starting page. The DOCX source
+restores formatting and table structure for Writer-compatible HTML paste,
+while plain text remains available for other applications; a selected table
+cell is copied as a cell rather than its visual PDF row. Keep holding the mouse
+button to use the wheel, or drag above or below a page to auto-scroll while
+extending the selection.
+Press `e` to open the export tool. Choose PDF, plain text, or Markdown with
+`j` / `k` and `Enter`, then select a destination in the save dialog. PDF uses
+an isolated LibreOffice profile; the text formats are exported by Pandoc.
+Markdown uses Pandoc's native Markdown writer with ATX headings, so Word
+Heading 1, Heading 2, and later styles become `#`, `##`, and matching
+hash-prefixed levels. Every format replaces the final file only after a
+successful conversion.
 
 ## Dependencies
 
@@ -147,7 +176,7 @@ pandoc
 ```
 
 The installed application uses `soffice`, which is provided by LibreOffice, and
-`pandoc` for plain-text export.
+`pandoc` for plain-text and Markdown export.
 
 ## Install
 
@@ -178,7 +207,8 @@ make check
 The tests cover the position-restoration policy, including unchanged
 pagination, pagination reflow, removed pages, and scroll-range clamping. The
 conversion command tests confirm each preview uses an isolated LibreOffice
-profile and Writer's PDF export filter, and that plain-text export uses Pandoc.
+profile and Writer's PDF export filter, and that plain-text and Markdown export
+use Pandoc's native writers.
 
 With a desktop display available, run the live-refresh smoke test too:
 
@@ -190,6 +220,17 @@ PYTHONPATH=src python3 tests/ui_refresh_smoke.py /tmp/see-docx-refresh.docx
 It scrolls the preview, updates a private copy of the supplied DOCX, and
 asserts that the page and within-page offset survive the real conversion and
 file-monitor refresh.
+
+Run the focused-comment smoke test to exercise the realized GTK overlay:
+
+```bash
+make comments-smoke
+```
+
+It creates a temporary commented DOCX, focuses its comment rail, and verifies
+that the selected thread leaves an exact-size ghost in the rail while a mapped,
+interactive copy appears beside the page. It then closes comment focus and
+checks that the still-allocated empty layer passes document input through.
 
 ## Limit of position preservation
 

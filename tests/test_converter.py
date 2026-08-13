@@ -49,8 +49,32 @@ class ConverterTests(unittest.TestCase):
         self.assertEqual(command[0], "pandoc")
         self.assertIn("--from=docx", command)
         self.assertIn("--to=plain", command)
-        self.assertEqual(command[command.index("--output") + 1], str(paths.text))
+        self.assertEqual(command[command.index("--output") + 1], str(paths.output))
         self.assertTrue(command[-1].endswith("export-000007/source.docx"))
+
+    def test_uses_pandoc_markdown_writer_for_atx_headings(self) -> None:
+        converter = PandocConverter.markdown()
+        try:
+            paths = converter.paths_for(7)
+            command = converter.command(paths)
+        finally:
+            converter.close()
+
+        self.assertIn("--from=docx", command)
+        self.assertIn("--to=markdown", command)
+        self.assertIn("--markdown-headings=atx", command)
+        self.assertEqual(paths.output.suffix, ".md")
+
+    def test_plain_text_export_keeps_each_paragraph_on_one_line(self) -> None:
+        # Pandoc otherwise hard-wraps prose at its default output width, adding
+        # visual line breaks that were not paragraph boundaries in the DOCX.
+        converter = PandocConverter()
+        try:
+            command = converter.command(converter.paths_for(1))
+        finally:
+            converter.close()
+
+        self.assertIn("--wrap=none", command)
 
     def test_saves_plain_text_by_atomically_replacing_the_destination(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -60,7 +84,11 @@ class ConverterTests(unittest.TestCase):
             rendered_text.write_text("new text\n", encoding="utf-8")
             destination.write_text("old text\n", encoding="utf-8")
 
-            saved = PandocConverter.save_text(rendered_text, destination)
+            converter = PandocConverter()
+            try:
+                saved = converter.save_output(rendered_text, destination)
+            finally:
+                converter.close()
 
             self.assertEqual(saved, destination)
             self.assertEqual(destination.read_text(encoding="utf-8"), "new text\n")

@@ -32,6 +32,48 @@ _DOCUMENT_XML = b'''<?xml version="1.0" encoding="UTF-8"?>
 </w:document>
 '''
 
+_RUNNING_MATTER_DOCUMENT_XML = b'''<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+  xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <w:body>
+    <w:p><w:r><w:t>Body text</w:t></w:r></w:p>
+    <w:sectPr>
+      <w:headerReference w:type="default" r:id="rIdHeader"/>
+      <w:footerReference w:type="default" r:id="rIdFooter"/>
+    </w:sectPr>
+  </w:body>
+</w:document>
+'''
+
+_RUNNING_MATTER_RELATIONSHIPS_XML = b'''<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship
+    Id="rIdHeader"
+    Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header"
+    Target="header1.xml"/>
+  <Relationship
+    Id="rIdFooter"
+    Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer"
+    Target="footer1.xml"/>
+</Relationships>
+'''
+
+_HEADER_XML = b'''<?xml version="1.0" encoding="UTF-8"?>
+<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:p>
+    <w:r><w:t xml:space="preserve">Page </w:t></w:r>
+    <w:fldSimple w:instr="PAGE"><w:r><w:t>1</w:t></w:r></w:fldSimple>
+  </w:p>
+</w:hdr>
+'''
+
+_FOOTER_XML = b'''<?xml version="1.0" encoding="UTF-8"?>
+<w:ftr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:p><w:r><w:t>Running footer</w:t></w:r></w:p>
+</w:ftr>
+'''
+
 
 class RichTextSelectionTests(unittest.TestCase):
     def _source_path(self, directory: str) -> Path:
@@ -73,3 +115,30 @@ class RichTextSelectionTests(unittest.TestCase):
         self.assertIn("<td", payload.html)
         self.assertIn("<strong>Passed</strong>", payload.html)
         self.assertNotIn("Alpha", payload.html)
+
+    def test_running_header_and_footer_text_are_separate_selection_flows(
+        self,
+    ) -> None:
+        # Running matter renders into the PDF but is not part of document.xml's
+        # body flow, so retain it separately for semantic pointer selection.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "running-matter.docx"
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr("word/document.xml", _RUNNING_MATTER_DOCUMENT_XML)
+                archive.writestr(
+                    "word/_rels/document.xml.rels",
+                    _RUNNING_MATTER_RELATIONSHIPS_XML,
+                )
+                archive.writestr("word/header1.xml", _HEADER_XML)
+                archive.writestr("word/footer1.xml", _FOOTER_XML)
+
+            source = viewer._docx_rich_text_source(path)
+
+        self.assertIsNotNone(source)
+        self.assertEqual(
+            source._selection_flow_texts,
+            {
+                "header": ("Page 1", "Page "),
+                "footer": ("Running footer",),
+            },
+        )

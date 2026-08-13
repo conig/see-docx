@@ -78,6 +78,25 @@ class ViewerStyleTests(unittest.TestCase):
             css,
         )
 
+    def test_action_notifications_use_the_active_theme_without_excess_chrome(self) -> None:
+        css = self._fallback_css()
+
+        self.assertIn(
+            ".see-docx-notification {\n"
+            "  background-color: #202326;\n"
+            "  border: 1px solid #3b4148;\n"
+            "  border-left: 3px solid #5ced30;\n"
+            "  border-radius: 4px;\n"
+            "  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.34);\n",
+            css,
+        )
+        self.assertIn(
+            ".see-docx-notification-detail {\n"
+            "  color: #a9b2bd;\n"
+            "  font-size: 0.76em;\n",
+            css,
+        )
+
     def test_reading_progress_maps_and_clamps_scroll_position(self) -> None:
         self.assertEqual(_reading_progress_fraction(0, 400), 0.0)
         self.assertEqual(_reading_progress_fraction(100, 400), 0.25)
@@ -149,13 +168,13 @@ class ViewerStyleTests(unittest.TestCase):
         self.assertIn(
             ".see-docx-comments-header {\n"
             f"  min-height: {COMMENTS_HEADER_HEIGHT}px;\n"
-            "  padding: 7px 12px 6px;\n"
+            "  padding: 4px 12px;\n"
             "}",
             css,
         )
         self.assertIn(
             ".see-docx-comments-header-top {\n"
-            "  min-height: 17px;\n"
+            "  min-height: 16px;\n"
             "}",
             css,
         )
@@ -163,6 +182,15 @@ class ViewerStyleTests(unittest.TestCase):
             ".see-docx-comments-key {\n"
             "  color: #a9b2bd;\n"
             "  font-size: 0.68em;\n",
+            css,
+        )
+        self.assertIn(
+            ".see-docx-comment-thread.comment-rail-ghost {\n"
+            "  background-color: transparent;\n"
+            "  border: 1px dashed #3b4148;\n"
+            "  border-left: 2px dashed #5ced30;\n"
+            "  border-radius: 5px;\n"
+            "  box-shadow: 0 7px 18px rgba(0, 0, 0, 0.24),\n",
             css,
         )
 
