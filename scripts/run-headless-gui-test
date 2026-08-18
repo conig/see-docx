@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# Run one graphical test in a disposable headless Sway session.
+
+set -Eeuo pipefail
+
+with_session_bus=${SEE_DOCX_HEADLESS_DBUS:-0}
+if [[ ${1:-} == --session-bus ]]; then
+    shift
+    if [[ $with_session_bus != 1 ]]; then
+        command -v dbus-run-session >/dev/null || {
+            printf 'headless GUI tests require dbus-run-session\n' >&2
+            exit 127
+        }
+        exec env SEE_DOCX_HEADLESS_DBUS=1 dbus-run-session -- "$0" "$@"
+    fi
+fi
+if [[ ${1:-} == -- ]]; then
+    shift
+fi
+if (($# == 0)); then
+    printf 'usage: %s [--session-bus] [--] COMMAND [ARG ...]\n' "$0" >&2
+    exit 2
+fi
+
+for command in sway swaymsg grim wtype jq gcc wayland-scanner; do
+    if ! command -v "$command" >/dev/null; then
+        printf 'headless GUI tests require %s\n' "$command" >&2
+        exit 127
+    fi
+done
+
+runtime=$(mktemp -d "${TMPDIR:-/tmp}/see-docx-headless-gui.XXXXXX")
+chmod 700 "$runtime"
+config="$runtime/sway.config"
+log="$runtime/sway.log"
+sway_pid=
+
+cat >"$config" <<'EOF'
+xwayland disable
+default_border none
+default_floating_border none
+focus_follows_mouse no
+mouse_warping none
+seat seat0 fallback true
+seat seat0 attach *
+output HEADLESS-1 resolution 1920x1080
+workspace number 15 output HEADLESS-1
+workspace number 15
+EOF
+
+capture_failure() {
+    local artifacts
+    artifacts=$(mktemp -d "${TMPDIR:-/tmp}/see-docx-headless-gui-failure.XXXXXX")
+    if [[ -f $runtime/failure.png ]]; then
+        cp "$runtime/failure.png" "$artifacts/screenshot.png"
+    else
+        grim -c "$artifacts/screenshot.png" >/dev/null 2>&1 || true
+    fi
+    swaymsg -t get_tree -r >"$artifacts/tree.json" 2>/dev/null || true
+    swaymsg -t get_workspaces -r >"$artifacts/workspaces.json" 2>/dev/null || true
+    cp "$config" "$log" "$artifacts/" 2>/dev/null || true
+    printf 'headless GUI artifacts: %s\n' "$artifacts" >&2
+}
+
+cleanup() {
+    local status=$?
+    trap - EXIT INT TERM
+    if ((status != 0)) && [[ -n ${WAYLAND_DISPLAY:-} ]]; then
+        capture_failure
+    fi
+    if [[ -n $sway_pid ]]; then
+        kill "$sway_pid" 2>/dev/null || true
+        wait "$sway_pid" 2>/dev/null || true
+    fi
+    rm -rf "$runtime"
+    exit "$status"
+}
+trap cleanup EXIT INT TERM
+
+export XDG_RUNTIME_DIR="$runtime"
+unset DISPLAY WAYLAND_DISPLAY SWAYSOCK I3SOCK
+if [[ $with_session_bus != 1 ]]; then
+    # Do not let portal or application discovery escape to the user's desktop.
+    # GTK and the disposable Writer instance used by this project do not need
+    # a session bus. Tests which genuinely need one can opt into a private bus.
+    export DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/no-session-bus"
+fi
+
+WLR_BACKENDS=headless WLR_RENDERER=pixman sway -c "$config" >"$log" 2>&1 &
+sway_pid=$!
+
+for _attempt in $(seq 1 200); do
+    SWAYSOCK=$(find "$runtime" -maxdepth 1 -type s -name 'sway-ipc.*.sock' -print -quit)
+    WAYLAND_DISPLAY=$(
+        find "$runtime" -maxdepth 1 -type s -name 'wayland-*' ! -name '*.lock' \
+            -printf '%f\n' -quit
+    )
+    if [[ -n $SWAYSOCK && -n $WAYLAND_DISPLAY ]]; then
+        break
+    fi
+    if ! kill -0 "$sway_pid" 2>/dev/null; then
+        cat "$log" >&2
+        exit 1
+    fi
+    sleep 0.05
+done
+
+if [[ -z ${SWAYSOCK:-} || -z ${WAYLAND_DISPLAY:-} ]]; then
+    printf 'headless Sway did not publish its sockets\n' >&2
+    cat "$log" >&2
+    exit 1
+fi
+export SWAYSOCK WAYLAND_DISPLAY
+export SEE_DOCX_GUI_FAILURE_SCREENSHOT="$runtime/failure.png"
+unset GTK_USE_PORTAL GIO_USE_PORTALS
+export GDK_BACKEND=wayland GIO_USE_VFS=local NO_AT_BRIDGE=1
+export XDG_CURRENT_DESKTOP=sway XDG_SESSION_DESKTOP=sway
+
+swaymsg -q workspace number 15
+swaymsg -t get_outputs -r | jq -e \
+    'any(.[]; .active and .name == "HEADLESS-1" and
+         .rect.width == 1920 and .rect.height == 1080)' >/dev/null
+swaymsg -t get_workspaces -r | jq -e \
+    'any(.[]; .focused and .name == "15")' >/dev/null
+
+"$@"

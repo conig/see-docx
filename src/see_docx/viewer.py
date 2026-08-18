@@ -7,10 +7,13 @@ import ctypes.util
 from difflib import SequenceMatcher
 from functools import lru_cache
 from html import escape as html_escape
+from io import BytesIO
 import json
 import math
 import os
+import re
 import shlex
+import struct
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime
@@ -54,6 +57,9 @@ TEXT_SELECTION_LINE_PADDING = 4.0
 SELECTION_AUTO_SCROLL_TICK_MS = 16
 SELECTION_AUTO_SCROLL_MIN_STEP = 12.0
 SELECTION_AUTO_SCROLL_MAX_STEP = 52.0
+TABLE_COPY_BUTTON_SIZE = 26.0
+TABLE_COPY_BUTTON_PAGE_MARGIN = 4.0
+TABLE_COPY_BUTTON_GAP = 6.0
 _THEME_STATE_SCHEMA_VERSION = 1
 _THEME_STATE_ROLES = frozenset(
     {
@@ -88,12 +94,8 @@ COMMENT_BODY_MIN_HEIGHT = 28
 COMMENT_ACTIVE_BODY_MAX_HEIGHT = 320
 COMMENT_ANCHOR_CONTEXT_CHARS = 48
 COMMENT_ANCHOR_MATCH_CHARS = 96
-# Keep the right edge of every card fixed. The inactive left inset leaves the
-# active card roughly 20% wider without moving either card's right edge.
-COMMENT_INACTIVE_CARD_INSET = 48
 COMMENT_FLOAT_GUTTER = 18
-COMMENT_FLOAT_MIN_WIDTH = 240
-COMMENT_FLOAT_MAX_WIDTH = 320
+COMMENT_FLOAT_WIDTH = 300
 OUTLINE_HEADING_MAX_CHARS = 22
 OUTLINE_NAV_SPACING = 7
 OUTLINE_REFERENCE_MARGIN_WIDTH = OUTLINE_NAV_SPACING * 3
@@ -455,15 +457,14 @@ def _comment_float_geometry(
     left = page_right + COMMENT_FLOAT_GUTTER
     right = canvas_width - COMMENT_FLOAT_GUTTER
     available_width = right - left
-    if available_width < COMMENT_FLOAT_MIN_WIDTH:
+    if available_width < COMMENT_FLOAT_WIDTH:
         return None
-    width = min(COMMENT_FLOAT_MAX_WIDTH, available_width)
     height = min(card_height, max(1.0, canvas_height - 2 * COMMENT_FLOAT_GUTTER))
     top = min(
         max(COMMENT_FLOAT_GUTTER, anchor_y - height / 2),
         max(COMMENT_FLOAT_GUTTER, canvas_height - COMMENT_FLOAT_GUTTER - height),
     )
-    return round(left), round(top), round(width)
+    return round(left), round(top), COMMENT_FLOAT_WIDTH
 
 
 def _app_css(widget: Gtk.Widget) -> bytes:
@@ -1120,6 +1121,7 @@ class RichTextClipboardPayload:
 
     text: str
     html: str
+    odt: bytes | None = None
 
 
 @dataclass(frozen=True)
@@ -1139,6 +1141,12 @@ class _DocxRun:
         for opening, closing in reversed(self.tags):
             rendered = f"{opening}{rendered}{closing}"
         return rendered
+
+    def clipped(self, start: int, end: int) -> _DocxRun | None:
+        """Return this run's selected characters with its formatting intact."""
+
+        text = self.text[max(start, 0) : max(end, 0)]
+        return _DocxRun(text, self.tags) if text else None
 
 
 @dataclass(frozen=True)
@@ -1167,6 +1175,24 @@ class _DocxParagraph:
                 )
             cursor = run_end
         return f"{self.opening_tag}{''.join(content)}</p>"
+
+    def clipped(self, start: int, end: int) -> _DocxParagraph | None:
+        """Return a formatted paragraph containing only the selected range."""
+
+        cursor = 0
+        runs: list[_DocxRun] = []
+        for run in self.runs:
+            run_end = cursor + len(run.text)
+            overlap_start = max(start, cursor)
+            overlap_end = min(end, run_end)
+            if overlap_start < overlap_end:
+                clipped = run.clipped(
+                    overlap_start - cursor, overlap_end - cursor
+                )
+                if clipped is not None:
+                    runs.append(clipped)
+            cursor = run_end
+        return _DocxParagraph(tuple(runs), self.opening_tag) if runs else None
 
 
 @dataclass(frozen=True)
@@ -1202,6 +1228,26 @@ class _DocxTableCell:
     def full_html(self) -> str:
         return self.html_for_range(0, len(self.text))
 
+    def clipped(self, start: int, end: int) -> _DocxTableCell | None:
+        """Return selected cell text without discarding its DOCX run styles."""
+
+        cursor = 0
+        paragraphs: list[_DocxParagraph] = []
+        for paragraph in self.paragraphs:
+            paragraph_end = cursor + len(paragraph.text)
+            overlap_start = max(start, cursor)
+            overlap_end = min(end, paragraph_end)
+            if overlap_start < overlap_end:
+                clipped = paragraph.clipped(
+                    overlap_start - cursor, overlap_end - cursor
+                )
+                if clipped is not None:
+                    paragraphs.append(clipped)
+            cursor = paragraph_end + 1
+        if not paragraphs:
+            return None
+        return _DocxTableCell(tuple(paragraphs), self.colspan)
+
 
 @dataclass(frozen=True)
 class _DocxTable:
@@ -1233,6 +1279,23 @@ class _DocxTable:
             rows.append(f"<tr>{''.join(cells)}</tr>")
         return f"<table><tbody>{''.join(rows)}</tbody></table>"
 
+    @staticmethod
+    def html_for_rows(rows: Iterable[Iterable[_DocxTableCell]]) -> str:
+        """Render selected cells as one table instead of nested fragments."""
+
+        rendered_rows: list[str] = []
+        for row in rows:
+            cells: list[str] = []
+            for cell in row:
+                colspan = f' colspan="{cell.colspan}"' if cell.colspan > 1 else ""
+                content = "".join(
+                    paragraph.html_for_range(0, len(paragraph.text))
+                    for paragraph in cell.paragraphs
+                )
+                cells.append(f"<td{colspan}>{content}</td>")
+            rendered_rows.append(f"<tr>{''.join(cells)}</tr>")
+        return f"<table><tbody>{''.join(rendered_rows)}</tbody></table>"
+
 
 @dataclass(frozen=True)
 class _DocxSelectionFragment:
@@ -1241,6 +1304,10 @@ class _DocxSelectionFragment:
     start: int
     end: int
     content: _DocxParagraph | _DocxTableCell
+    table_index: int | None = None
+    row_index: int | None = None
+    column_start: int | None = None
+    column_end: int | None = None
 
     @property
     def text(self) -> str:
@@ -1248,6 +1315,241 @@ class _DocxSelectionFragment:
 
     def html_for_range(self, start: int, end: int) -> str:
         return self.content.html_for_range(start, end)
+
+
+@dataclass(frozen=True)
+class _DocxTableSelection:
+    """A rectangular table selection and its complete source cell ranges."""
+
+    payload: RichTextClipboardPayload
+    source_ranges: tuple[tuple[int, int], ...]
+
+
+@dataclass(frozen=True)
+class _TableCellLayout:
+    """One source table cell inferred from mapped PDF glyph geometry."""
+
+    fragment: _DocxSelectionFragment
+    left: float
+    top: float
+    right: float
+    bottom: float
+
+    def contains(self, point: tuple[float, float]) -> bool:
+        return (
+            self.left <= point[0] <= self.right
+            and self.top <= point[1] <= self.bottom
+        )
+
+
+@dataclass(frozen=True)
+class _TableCopyButton:
+    """One rendered-page copy control associated with a source table."""
+
+    table_index: int
+    left: float
+    top: float
+    right: float
+    bottom: float
+
+    def contains(self, point: tuple[float, float]) -> bool:
+        return (
+            self.left <= point[0] <= self.right
+            and self.top <= point[1] <= self.bottom
+        )
+
+
+def _odt_text(text: str) -> str:
+    """Escape text while retaining tabs, line breaks, and repeated spaces."""
+
+    rendered: list[str] = []
+    space_run = 0
+
+    def flush_spaces() -> None:
+        nonlocal space_run
+        if not space_run:
+            return
+        if space_run == 1:
+            rendered.append(" ")
+        else:
+            rendered.append(f'<text:s text:c="{space_run}"/>')
+        space_run = 0
+
+    for character in text:
+        if character == " ":
+            space_run += 1
+            continue
+        flush_spaces()
+        if character == "\t":
+            rendered.append("<text:tab/>")
+        elif character == "\n":
+            rendered.append("<text:line-break/>")
+        else:
+            rendered.append(html_escape(character, quote=False))
+    flush_spaces()
+    return "".join(rendered)
+
+
+def _odt_run_style(tags: tuple[tuple[str, str], ...]) -> tuple[tuple[str, str], ...]:
+    """Translate the inline DOCX properties retained for HTML into ODF."""
+
+    openings = tuple(opening for opening, _closing in tags)
+    properties: list[tuple[str, str]] = []
+    if "<strong>" in openings:
+        properties.append(("fo:font-weight", "bold"))
+    if "<em>" in openings:
+        properties.append(("fo:font-style", "italic"))
+    if "<u>" in openings:
+        properties.extend(
+            (
+                ("style:text-underline-style", "solid"),
+                ("style:text-underline-width", "auto"),
+            )
+        )
+    if "<s>" in openings:
+        properties.append(("style:text-line-through-style", "solid"))
+    if "<sup>" in openings:
+        properties.append(("style:text-position", "super 58%"))
+    elif "<sub>" in openings:
+        properties.append(("style:text-position", "sub 58%"))
+    return tuple(properties)
+
+
+def _odt_table(rows: tuple[tuple[_DocxTableCell, ...], ...]) -> bytes:
+    """Build Writer's embedded ODF representation of selected table cells."""
+
+    run_styles: dict[tuple[tuple[str, str], ...], str] = {}
+    for row in rows:
+        for cell in row:
+            for paragraph in cell.paragraphs:
+                for run in paragraph.runs:
+                    properties = _odt_run_style(run.tags)
+                    if properties and properties not in run_styles:
+                        run_styles[properties] = f"T{len(run_styles) + 1}"
+
+    automatic_styles = [
+        '<style:style style:name="Table1" style:family="table">'
+        '<style:table-properties table:align="margins"/>'
+        "</style:style>",
+        '<style:style style:name="Table1.A" style:family="table-column">'
+        '<style:table-column-properties style:rel-column-width="1*"/>'
+        "</style:style>",
+        '<style:style style:name="Table1.Cell" style:family="table-cell">'
+        '<style:table-cell-properties fo:padding="0.04in" '
+        'fo:border="0.5pt solid #000000"/>'
+        "</style:style>",
+    ]
+    for properties, name in run_styles.items():
+        attributes = " ".join(
+            f'{key}="{html_escape(value, quote=True)}"'
+            for key, value in properties
+        )
+        automatic_styles.append(
+            f'<style:style style:name="{name}" style:family="text">'
+            f"<style:text-properties {attributes}/></style:style>"
+        )
+
+    table_rows: list[str] = []
+    for row in rows:
+        cells: list[str] = []
+        for cell in row:
+            paragraphs: list[str] = []
+            for paragraph in cell.paragraphs:
+                runs: list[str] = []
+                for run in paragraph.runs:
+                    text = _odt_text(run.text)
+                    properties = _odt_run_style(run.tags)
+                    if properties:
+                        name = run_styles[properties]
+                        runs.append(
+                            f'<text:span text:style-name="{name}">{text}</text:span>'
+                        )
+                    else:
+                        runs.append(text)
+                paragraphs.append(
+                    '<text:p text:style-name="Table_20_Contents">'
+                    f"{''.join(runs)}</text:p>"
+                )
+            span = (
+                f' table:number-columns-spanned="{cell.colspan}"'
+                if cell.colspan > 1
+                else ""
+            )
+            cells.append(
+                '<table:table-cell table:style-name="Table1.Cell" '
+                f'office:value-type="string"{span}>{"".join(paragraphs)}'
+                "</table:table-cell>"
+            )
+            cells.extend(
+                "<table:covered-table-cell/>" for _index in range(cell.colspan - 1)
+            )
+        table_rows.append(f"<table:table-row>{''.join(cells)}</table:table-row>")
+
+    column_count = max((sum(cell.colspan for cell in row) for row in rows), default=1)
+    namespaces = (
+        'xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" '
+        'xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" '
+        'xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" '
+        'xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" '
+        'xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0"'
+    )
+    rendered_table_rows = "".join(table_rows)
+    if len(rows) == 1:
+        # Writer marks an entire copied row this way in its native embedded
+        # ODF clipboard source.  Without the wrapper it treats the payload as
+        # ordinary table content and appends it independently to every cell
+        # in an EntireRow destination selection.
+        rendered_table_rows = (
+            f"<table:table-header-rows>{rendered_table_rows}"
+            "</table:table-header-rows>"
+        )
+    content = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        f'<office:document-content {namespaces} office:version="1.4">'
+        f'<office:automatic-styles>{"".join(automatic_styles)}</office:automatic-styles>'
+        '<office:body><office:text>'
+        '<table:table table:name="Table1" table:style-name="Table1">'
+        '<table:table-column table:style-name="Table1.A" '
+        f'table:number-columns-repeated="{column_count}"/>'
+        f"{rendered_table_rows}</table:table><text:p/>"
+        "</office:text></office:body></office:document-content>"
+    ).encode("utf-8")
+    styles = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        f'<office:document-styles {namespaces} office:version="1.4">'
+        '<office:styles><style:style style:name="Standard" '
+        'style:family="paragraph" style:class="text"/>'
+        '<style:style style:name="Table_20_Contents" style:display-name="Table Contents" '
+        'style:family="paragraph" style:parent-style-name="Standard"/>'
+        "</office:styles><office:automatic-styles/><office:master-styles/>"
+        "</office:document-styles>"
+    ).encode("utf-8")
+    manifest = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<manifest:manifest '
+        'xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" '
+        'manifest:version="1.4">'
+        '<manifest:file-entry manifest:full-path="/" manifest:version="1.4" '
+        'manifest:media-type="application/vnd.oasis.opendocument.text"/>'
+        '<manifest:file-entry manifest:full-path="content.xml" '
+        'manifest:media-type="text/xml"/>'
+        '<manifest:file-entry manifest:full-path="styles.xml" '
+        'manifest:media-type="text/xml"/>'
+        "</manifest:manifest>"
+    ).encode("utf-8")
+    output = BytesIO()
+    with zipfile.ZipFile(output, "w") as archive:
+        archive.writestr(
+            "mimetype",
+            "application/vnd.oasis.opendocument.text",
+            compress_type=zipfile.ZIP_STORED,
+        )
+        archive.writestr("content.xml", content, compress_type=zipfile.ZIP_DEFLATED)
+        archive.writestr("styles.xml", styles, compress_type=zipfile.ZIP_DEFLATED)
+        archive.writestr(
+            "META-INF/manifest.xml", manifest, compress_type=zipfile.ZIP_DEFLATED
+        )
+    return output.getvalue()
 
 
 class _DocxRichTextSource:
@@ -1288,6 +1590,173 @@ class _DocxRichTextSource:
         return RichTextClipboardPayload(
             text=self.plain_text,
             html=f"<html><body>{content}</body></html>",
+        )
+
+    def _table_fragment_at(self, source_index: int) -> _DocxSelectionFragment | None:
+        """Return the table cell containing one mapped PDF glyph."""
+
+        return next(
+            (
+                fragment
+                for fragment in self._fragments
+                if fragment.table_index is not None
+                and fragment.start <= source_index < fragment.end
+            ),
+            None,
+        )
+
+    def table_selection(
+        self, anchor_index: int, endpoint_index: int
+    ) -> _DocxTableSelection | None:
+        """Snap two glyph endpoints to a rectangular set of table cells."""
+
+        anchor = self._table_fragment_at(anchor_index)
+        endpoint = self._table_fragment_at(endpoint_index)
+        if anchor is None or endpoint is None:
+            return None
+        return self.table_selection_between(anchor, endpoint)
+
+    def table_selection_between(
+        self,
+        anchor: _DocxSelectionFragment,
+        endpoint: _DocxSelectionFragment,
+    ) -> _DocxTableSelection | None:
+        """Copy the rectangular cell grid bounded by two source cells."""
+
+        if (
+            anchor.table_index is None
+            or anchor.table_index != endpoint.table_index
+            or anchor.row_index is None
+            or endpoint.row_index is None
+            or anchor.column_start is None
+            or anchor.column_end is None
+            or endpoint.column_start is None
+            or endpoint.column_end is None
+        ):
+            return None
+        first_row, last_row = sorted((anchor.row_index, endpoint.row_index))
+        first_column = min(anchor.column_start, endpoint.column_start)
+        last_column = max(anchor.column_end, endpoint.column_end)
+        fragments = tuple(
+            sorted(
+                (
+                    fragment
+                    for fragment in self._fragments
+                    if fragment.table_index == anchor.table_index
+                    and fragment.row_index is not None
+                    and first_row <= fragment.row_index <= last_row
+                    and fragment.column_start is not None
+                    and fragment.column_end is not None
+                    and fragment.column_start < last_column
+                    and first_column < fragment.column_end
+                    and isinstance(fragment.content, _DocxTableCell)
+                ),
+                key=lambda fragment: (
+                    fragment.row_index if fragment.row_index is not None else -1,
+                    fragment.column_start
+                    if fragment.column_start is not None
+                    else -1,
+                ),
+            )
+        )
+        return self._table_selection_from_fragments(fragments)
+
+    def table_selection_for_table(
+        self, table_index: int
+    ) -> _DocxTableSelection | None:
+        """Return one structured clipboard selection for a complete table."""
+
+        fragments = tuple(
+            sorted(
+                (
+                    fragment
+                    for fragment in self._fragments
+                    if fragment.table_index == table_index
+                    and fragment.row_index is not None
+                    and fragment.column_start is not None
+                    and isinstance(fragment.content, _DocxTableCell)
+                ),
+                key=lambda fragment: (
+                    fragment.row_index if fragment.row_index is not None else -1,
+                    fragment.column_start
+                    if fragment.column_start is not None
+                    else -1,
+                ),
+            )
+        )
+        return self._table_selection_from_fragments(fragments)
+
+    @staticmethod
+    def _table_selection_from_fragments(
+        fragments: tuple[_DocxSelectionFragment, ...],
+    ) -> _DocxTableSelection | None:
+        """Build one table-shaped payload from row/column-sorted cells."""
+
+        if not fragments:
+            return None
+        rows: list[tuple[_DocxTableCell, ...]] = []
+        current_row: int | None = None
+        current_cells: list[_DocxTableCell] = []
+        for fragment in fragments:
+            if not isinstance(fragment.content, _DocxTableCell):
+                continue
+            if current_row is not None and fragment.row_index != current_row:
+                rows.append(tuple(current_cells))
+                current_cells = []
+            current_row = fragment.row_index
+            current_cells.append(fragment.content)
+        if current_cells:
+            rows.append(tuple(current_cells))
+        selected_rows = tuple(rows)
+        if not selected_rows:
+            return None
+        text = "\n".join(
+            "\t".join(cell.text for cell in row) for row in selected_rows
+        )
+        html = _DocxTable.html_for_rows(selected_rows)
+        return _DocxTableSelection(
+            payload=RichTextClipboardPayload(
+                text=text,
+                html=f"<html><body>{html}</body></html>",
+                odt=_odt_table(selected_rows),
+            ),
+            source_ranges=tuple(
+                (fragment.start, fragment.end) for fragment in fragments
+            ),
+        )
+
+    def cell_text_selection(
+        self,
+        fragment: _DocxSelectionFragment,
+        anchor_index: int,
+        endpoint_index: int,
+    ) -> _DocxTableSelection | None:
+        """Copy a dragged text range as one formatted one-cell table."""
+
+        if not isinstance(fragment.content, _DocxTableCell):
+            return None
+        first, last = sorted((anchor_index, endpoint_index))
+        start = max(fragment.start, first)
+        end = min(fragment.end, last + 1)
+        if start >= end:
+            return None
+        cell = fragment.content.clipped(
+            start - fragment.start, end - fragment.start
+        )
+        if cell is None:
+            return None
+        rows = ((cell,),)
+        return _DocxTableSelection(
+            payload=RichTextClipboardPayload(
+                text=self._selection_text[start:end],
+                html=(
+                    "<html><body>"
+                    f"{_DocxTable.html_for_rows(rows)}"
+                    "</body></html>"
+                ),
+                odt=_odt_table(rows),
+            ),
+            source_ranges=((start, end),),
         )
 
     def payload_for_range(
@@ -1353,7 +1822,18 @@ _GtkClipboardGetFunc = ctypes.CFUNCTYPE(
 _GtkClipboardClearFunc = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p)
 _RICH_CLIPBOARD_HTML_INFO = 1
 _RICH_CLIPBOARD_TEXT_INFO = 2
-_RICH_CLIPBOARD_TARGETS = (
+_RICH_CLIPBOARD_ODT_INFO = 3
+_RICH_CLIPBOARD_OBJECT_DESCRIPTOR_INFO = 4
+_RICH_CLIPBOARD_EMBED_SOURCE_TARGET = (
+    b'application/x-openoffice-embed-source-xml;windows_formatname="Star Embed Source (XML)"'
+)
+_RICH_CLIPBOARD_OBJECT_DESCRIPTOR_TARGET = (
+    b'application/x-openoffice-objectdescriptor-xml;windows_formatname="Star Object Descriptor (XML)";'
+    b'classname="8BC6B165-B1B2-4EDD-aa47-dae2ee689dd6";'
+    b'typename="LibreOffice Text Document";viewaspect="1";'
+    b'width="17000";height="3000";posx="0";posy="0"'
+)
+_RICH_CLIPBOARD_BASE_TARGETS = (
     (b"text/html", _RICH_CLIPBOARD_HTML_INFO),
     (b"text/plain;charset=utf-8", _RICH_CLIPBOARD_TEXT_INFO),
     (b"UTF8_STRING", _RICH_CLIPBOARD_TEXT_INFO),
@@ -1363,6 +1843,21 @@ _RICH_CLIPBOARD_TARGETS = (
 _native_gtk_clipboard: ctypes.CDLL | None = None
 _native_gtk_clipboard_loaded = False
 _native_clipboard_owners: dict[int, RichTextClipboardPayload] = {}
+
+
+def _libreoffice_object_descriptor() -> bytes:
+    """Return Writer's descriptor companion for an embedded ODF document."""
+
+    name = b"LibreOffice Text Document"
+    class_id = bytes.fromhex("65b1c68bb2b1dd4eaa47dae2ee689dd6")
+    body = (
+        class_id
+        + struct.pack("<IiiiiH", 1, 17000, 3000, 0, 0, len(name))
+        + name
+        + b"\0\0"
+        + struct.pack("<Q", 0x89ABCDEF01234567)
+    )
+    return struct.pack("<I", len(body) + 4) + body
 
 
 def _native_gtk_clipboard_api() -> ctypes.CDLL | None:
@@ -1421,6 +1916,21 @@ def _on_native_clipboard_get(
         target = library.gtk_selection_data_get_target(selection_data)
         library.gtk_selection_data_set(selection_data, target, 8, buffer, len(data))
         return
+    if info in {
+        _RICH_CLIPBOARD_ODT_INFO,
+        _RICH_CLIPBOARD_OBJECT_DESCRIPTOR_INFO,
+    }:
+        if payload.odt is None:
+            return
+        data = (
+            payload.odt
+            if info == _RICH_CLIPBOARD_ODT_INFO
+            else _libreoffice_object_descriptor()
+        )
+        buffer = (ctypes.c_ubyte * len(data)).from_buffer_copy(data)
+        target = library.gtk_selection_data_get_target(selection_data)
+        library.gtk_selection_data_set(selection_data, target, 8, buffer, len(data))
+        return
     data = payload.text.encode("utf-8")
     library.gtk_selection_data_set_text(selection_data, data, len(data))
 
@@ -1440,17 +1950,28 @@ def _publish_rich_clipboard(
     library = _native_gtk_clipboard_api()
     if library is None or not hasattr(clipboard, "__gpointer__"):
         return False
-    entries = (_GtkTargetEntry * len(_RICH_CLIPBOARD_TARGETS))(
+    targets = _RICH_CLIPBOARD_BASE_TARGETS
+    if payload.odt is not None:
+        targets = (
+            (
+                _RICH_CLIPBOARD_OBJECT_DESCRIPTOR_TARGET,
+                _RICH_CLIPBOARD_OBJECT_DESCRIPTOR_INFO,
+            ),
+            (_RICH_CLIPBOARD_EMBED_SOURCE_TARGET, _RICH_CLIPBOARD_ODT_INFO),
+            (b"application/vnd.oasis.opendocument.text", _RICH_CLIPBOARD_ODT_INFO),
+            *targets,
+        )
+    entries = (_GtkTargetEntry * len(targets))(
         *(
             _GtkTargetEntry(target, 0, info)
-            for target, info in _RICH_CLIPBOARD_TARGETS
+            for target, info in targets
         )
     )
     address = hash(clipboard)
     published = library.gtk_clipboard_set_with_data(
         ctypes.c_void_p(address),
         entries,
-        len(entries),
+        len(targets),
         _on_native_clipboard_get,
         _on_native_clipboard_clear,
         None,
@@ -1493,6 +2014,288 @@ def _fold_selection_whitespace(text: str) -> tuple[str, list[int]]:
         folded.pop()
         indices.pop()
     return "".join(folded), indices
+
+
+def _source_character_matches(
+    rendered_text: str, source_text: str
+) -> dict[int, int]:
+    """Align PDF characters to OOXML without long-document autojunk loss.
+
+    The compact character matcher retains whitespace-tolerant coverage for
+    prose.  A second lexical pass anchors exact non-whitespace tokens.  On a
+    long document, repeated headers and other rendered-only content make
+    character frequencies look like junk to ``SequenceMatcher``; whole tokens
+    stay both fast and semantically distinctive enough to recover later table
+    cells.
+    """
+
+    rendered, rendered_indices = _fold_selection_whitespace(rendered_text)
+    source, source_indices = _fold_selection_whitespace(source_text)
+    matches: dict[int, int] = {}
+    if rendered and source:
+        matcher = SequenceMatcher(None, rendered, source)
+        for match in matcher.get_matching_blocks():
+            for delta in range(match.size):
+                matches[rendered_indices[match.a + delta]] = source_indices[
+                    match.b + delta
+                ]
+
+    rendered_tokens = tuple(re.finditer(r"\S+", rendered_text))
+    source_tokens = tuple(re.finditer(r"\S+", source_text))
+    if not rendered_tokens or not source_tokens:
+        return matches
+    token_matcher = SequenceMatcher(
+        None,
+        tuple(token.group() for token in rendered_tokens),
+        tuple(token.group() for token in source_tokens),
+    )
+    for match in token_matcher.get_matching_blocks():
+        for delta in range(match.size):
+            rendered_token = rendered_tokens[match.a + delta]
+            source_token = source_tokens[match.b + delta]
+            if rendered_token.group() != source_token.group():
+                continue
+            for character_offset in range(len(rendered_token.group())):
+                matches[rendered_token.start() + character_offset] = (
+                    source_token.start() + character_offset
+                )
+    return matches
+
+
+def _table_column_bands(
+    bounds: dict[tuple[int, int, int], tuple[float, float]],
+) -> dict[tuple[int, int, int], tuple[float, float]]:
+    """Expand column glyph extents from each following cell's leading edge.
+
+    The midpoint between one column's final mapped glyph and the next
+    column's first glyph is not a cell boundary: a wide cell can have a large
+    unused line tail. DOCX table text is left-aligned by default, so the next
+    cell's leading edge, less the same small padding used at the table edges,
+    is the stable rendered boundary.
+    """
+
+    if not bounds:
+        return {}
+    padding = 6.0
+    ordered = sorted(bounds.items(), key=lambda item: (item[0][1], item[0][2]))
+    boundaries = [
+        following[1][0] - padding
+        for following in ordered[1:]
+    ]
+    result: dict[tuple[int, int, int], tuple[float, float]] = {}
+    for index, (key, extent) in enumerate(ordered):
+        before = boundaries[index - 1] if index else extent[0] - padding
+        after = boundaries[index] if index < len(boundaries) else extent[1] + padding
+        result[key] = (before, after)
+    return result
+
+
+def _table_row_bands(
+    bounds: dict[tuple[int, int], tuple[float, float]],
+) -> dict[tuple[int, int], tuple[float, float]]:
+    """Expand row glyph extents from each following row's leading edge.
+
+    Interleaved PDF text can falsely map the next row's leading line into the
+    preceding source row.  A midpoint involving that contaminated extent is
+    therefore not a stable row boundary.  The independently located leading
+    glyph of the following row, less normal cell padding, is authoritative.
+    """
+
+    if not bounds:
+        return {}
+    padding = 6.0
+    ordered = sorted(bounds.items(), key=lambda item: item[0][1])
+    boundaries = [following[1][0] - padding for following in ordered[1:]]
+    result: dict[tuple[int, int], tuple[float, float]] = {}
+    for index, (key, extent) in enumerate(ordered):
+        before = boundaries[index - 1] if index else extent[0] - padding
+        after = boundaries[index] if index < len(boundaries) else extent[1] + padding
+        result[key] = (before, after)
+    return result
+
+
+def _unique_fragment_leading_glyph(
+    rendered: str, rendered_indices: list[int], fragment_text: str
+) -> int | None:
+    """Locate a cell's first glyph without relying on PDF reading order."""
+
+    fragment, _fragment_indices = _fold_selection_whitespace(fragment_text)
+    for length in range(min(8, len(fragment)), min(32, len(fragment)) + 1):
+        prefix = fragment[:length]
+        start = rendered.find(prefix)
+        if start >= 0 and rendered.find(prefix, start + 1) < 0:
+            return rendered_indices[start]
+    return None
+
+
+def _table_cell_layouts(
+    source: _DocxRichTextSource,
+    mapping: dict[int, int],
+    text: str,
+    rectangles: list[Poppler.Rectangle],
+) -> tuple[_TableCellLayout, ...]:
+    """Infer source table-cell hit regions from mapped glyph positions."""
+
+    table_fragments = tuple(
+        fragment
+        for fragment in source._fragments
+        if fragment.table_index is not None
+        and fragment.row_index is not None
+        and fragment.column_start is not None
+        and fragment.column_end is not None
+        and isinstance(fragment.content, _DocxTableCell)
+    )
+    fragment_bounds: dict[
+        _DocxSelectionFragment, tuple[float, float, float, float]
+    ] = {}
+    for rendered_index, source_index in mapping.items():
+        if (
+            not 0 <= rendered_index < len(text)
+            or rendered_index >= len(rectangles)
+            or text[rendered_index].isspace()
+        ):
+            continue
+        fragment = next(
+            (
+                candidate
+                for candidate in table_fragments
+                if candidate.start <= source_index < candidate.end
+            ),
+            None,
+        )
+        if fragment is None:
+            continue
+        rectangle = rectangles[rendered_index]
+        bounds = (
+            min(float(rectangle.x1), float(rectangle.x2)),
+            min(float(rectangle.y1), float(rectangle.y2)),
+            max(float(rectangle.x1), float(rectangle.x2)),
+            max(float(rectangle.y1), float(rectangle.y2)),
+        )
+        previous = fragment_bounds.get(fragment)
+        fragment_bounds[fragment] = (
+            min(previous[0], bounds[0]) if previous else bounds[0],
+            min(previous[1], bounds[1]) if previous else bounds[1],
+            max(previous[2], bounds[2]) if previous else bounds[2],
+            max(previous[3], bounds[3]) if previous else bounds[3],
+        )
+
+    row_extents: dict[tuple[int, int], tuple[float, float]] = {}
+    column_extents: dict[tuple[int, int, int], tuple[float, float]] = {}
+    for fragment, bounds in fragment_bounds.items():
+        table_index = fragment.table_index
+        row_index = fragment.row_index
+        column_start = fragment.column_start
+        column_end = fragment.column_end
+        if (
+            table_index is None
+            or row_index is None
+            or column_start is None
+            or column_end is None
+        ):
+            continue
+        row_key = (table_index, row_index)
+        column_key = (table_index, column_start, column_end)
+        row_previous = row_extents.get(row_key)
+        row_extents[row_key] = (
+            min(row_previous[0], bounds[1]) if row_previous else bounds[1],
+            max(row_previous[1], bounds[3]) if row_previous else bounds[3],
+        )
+        column_previous = column_extents.get(column_key)
+        column_extents[column_key] = (
+            min(column_previous[0], bounds[0]) if column_previous else bounds[0],
+            max(column_previous[1], bounds[2]) if column_previous else bounds[2],
+        )
+
+    # Poppler may expose a borderless table in column-major order while OOXML
+    # stores it row-major. The global character alignment can consequently
+    # assign a neighbouring glyph to this column and corrupt its minimum X.
+    # Locate unique cell prefixes directly in the rendered page and use their
+    # leading glyphs as independent column anchors.
+    row_anchors: dict[tuple[int, int], list[float]] = {}
+    column_anchors: dict[tuple[int, int, int], list[float]] = {}
+    folded_text, folded_indices = _fold_selection_whitespace(text)
+    for fragment in table_fragments:
+        rendered_index = _unique_fragment_leading_glyph(
+            folded_text, folded_indices, fragment.text
+        )
+        if rendered_index is None or rendered_index >= len(rectangles):
+            continue
+        column_key = (
+            fragment.table_index,
+            fragment.column_start,
+            fragment.column_end,
+        )
+        rectangle = rectangles[rendered_index]
+        row_key = (fragment.table_index, fragment.row_index)
+        row_anchors.setdefault(row_key, []).append(
+            min(float(rectangle.y1), float(rectangle.y2))
+        )
+        column_anchors.setdefault(column_key, []).append(
+            min(float(rectangle.x1), float(rectangle.x2))
+        )
+    for row_key, anchors in row_anchors.items():
+        extent = row_extents.get(row_key)
+        if extent is None:
+            continue
+        row_extents[row_key] = (min(anchors), extent[1])
+    for column_key, anchors in column_anchors.items():
+        extent = column_extents.get(column_key)
+        if extent is None:
+            continue
+        ordered_anchors = sorted(anchors)
+        anchor = ordered_anchors[len(ordered_anchors) // 2]
+        column_extents[column_key] = (anchor, extent[1])
+
+    row_bands: dict[tuple[int, int], tuple[float, float]] = {}
+    column_bands: dict[tuple[int, int, int], tuple[float, float]] = {}
+    table_indices = {
+        fragment.table_index
+        for fragment in table_fragments
+        if fragment.table_index is not None
+    }
+    for table_index in table_indices:
+        row_bands.update(
+            _table_row_bands(
+                {
+                    key: extent
+                    for key, extent in row_extents.items()
+                    if key[0] == table_index
+                }
+            )
+        )
+        column_bands.update(
+            _table_column_bands(
+                {
+                    key: extent
+                    for key, extent in column_extents.items()
+                    if key[0] == table_index
+                }
+            )
+        )
+
+    layouts: list[_TableCellLayout] = []
+    for fragment in table_fragments:
+        row_key = (fragment.table_index, fragment.row_index)
+        column_key = (
+            fragment.table_index,
+            fragment.column_start,
+            fragment.column_end,
+        )
+        row_band = row_bands.get(row_key)
+        column_band = column_bands.get(column_key)
+        if row_band is None or column_band is None:
+            continue
+        layouts.append(
+            _TableCellLayout(
+                fragment,
+                column_band[0],
+                row_band[0],
+                column_band[1],
+                row_band[1],
+            )
+        )
+    return tuple(layouts)
 
 
 def _selection_flow_occurrences(
@@ -2055,12 +2858,14 @@ def _docx_rich_text_source(path: Path) -> _DocxRichTextSource | None:
             append("\n")
         elif element.tag == f"{_WORDPROCESSINGML}tbl":
             table = _docx_table(element, relationships)
+            table_index = len(blocks)
             blocks.append(table)
-            for row_element, row in zip(
+            for row_index, (row_element, row) in enumerate(zip(
                 element.findall(f"{_WORDPROCESSINGML}tr"),
                 table.rows,
                 strict=True,
-            ):
+            )):
+                column_index = 0
                 for cell_element, cell in zip(
                     row_element.findall(f"{_WORDPROCESSINGML}tc"),
                     row,
@@ -2084,8 +2889,18 @@ def _docx_rich_text_source(path: Path) -> _DocxRichTextSource | None:
                         if paragraph_index + 1 < len(cell.paragraphs):
                             cell_cursor += 1
                     start, end = append(cell.text)
-                    if start != end:
-                        fragments.append(_DocxSelectionFragment(start, end, cell))
+                    fragments.append(
+                        _DocxSelectionFragment(
+                            start,
+                            end,
+                            cell,
+                            table_index=table_index,
+                            row_index=row_index,
+                            column_start=column_index,
+                            column_end=column_index + cell.colspan,
+                        )
+                    )
+                    column_index += cell.colspan
                 append("\n")
     if not blocks:
         return None
@@ -2296,10 +3111,18 @@ class PdfPage(Gtk.DrawingArea):
         self._text_selection_start: tuple[float, float] | None = None
         self._text_selection_end: tuple[float, float] | None = None
         self._text_selection_flow: str | None = None
+        self._text_selection_source_ranges: tuple[tuple[int, int], ...] = ()
         self._selection_flow_map: dict[int, str] = {}
+        self._table_cell_layouts: tuple[_TableCellLayout, ...] = ()
+        self._table_fragment_map: dict[int, _DocxSelectionFragment] = {}
+        self._table_copy_hover_index: int | None = None
+        self._table_copy_button_hot = False
+        self._table_copy_pressed = False
+        self._selection_button_pressed = False
         self._selection_handler = selection_handler
         self._selection_scroll_handler = selection_scroll_handler
         self._text_cursor: Gdk.Cursor | None = None
+        self._copy_cursor: Gdk.Cursor | None = None
         self.set_app_paintable(True)
         self.set_halign(Gtk.Align.CENTER)
         _style(self, "see-docx-page")
@@ -2437,6 +3260,7 @@ class PdfPage(Gtk.DrawingArea):
         *,
         flow_map: dict[int, str] | None = None,
         flow: str | None = None,
+        eligible_indices: set[int] | None = None,
     ) -> int | None:
         """Return the selectable glyph closest to a document-space pointer."""
 
@@ -2460,6 +3284,7 @@ class PdfPage(Gtk.DrawingArea):
             )
             if character not in "\r\n"
             and (flow is None or (flow_map or {}).get(index, "main") == flow)
+            and (eligible_indices is None or index in eligible_indices)
         )
         try:
             return min(candidates)[2]
@@ -2483,6 +3308,53 @@ class PdfPage(Gtk.DrawingArea):
         end = getattr(self, "_text_selection_end", None)
         flow = getattr(self, "_text_selection_flow", None)
         flow_map = getattr(self, "_selection_flow_map", {})
+        source_ranges = getattr(self, "_text_selection_source_ranges", ())
+        source_mapping = getattr(self, "_source_character_map", {})
+        if source_ranges and source_mapping:
+            fragment_map = getattr(self, "_table_fragment_map", {})
+            complete_ranges = set(source_ranges)
+            selected_indices: set[int] = set()
+            for index, source_index in source_mapping.items():
+                source_selected = any(
+                    start <= source_index < end for start, end in source_ranges
+                )
+                fragment = fragment_map.get(index)
+                if fragment is None:
+                    if source_selected:
+                        selected_indices.add(index)
+                    continue
+                complete_cell_selected = (
+                    fragment.start,
+                    fragment.end,
+                ) in complete_ranges
+                if complete_cell_selected or (
+                    source_selected
+                    and fragment.start <= source_index < fragment.end
+                ):
+                    # Table geometry is authoritative for cell membership.
+                    # Repeated prose can make a linear text match point into
+                    # the selected source cell even though the rendered glyph
+                    # is visibly in its neighbour.
+                    selected_indices.add(index)
+            selected_indices.update(
+                index
+                for index, fragment in fragment_map.items()
+                if (fragment.start, fragment.end) in complete_ranges
+            )
+            if selected_indices:
+                selected_text = "".join(
+                    character
+                    for index, character in enumerate(text)
+                    if index in selected_indices
+                )
+                selected_rectangles = [
+                    rectangle
+                    for index, (character, rectangle) in enumerate(
+                        zip(text, rectangles, strict=True)
+                    )
+                    if index in selected_indices and character not in "\r\n"
+                ]
+                return selected_text, selected_rectangles
         if start is not None and end is not None:
             first = self._nearest_glyph_index(
                 text, rectangles, start, flow_map=flow_map, flow=flow
@@ -2588,7 +3460,224 @@ class PdfPage(Gtk.DrawingArea):
             return None
         return min(source_indices), max(source_indices) + 1
 
-    def _copy_selection(self, text: str, html: str | None = None) -> None:
+    def source_index_at(
+        self,
+        point: tuple[float, float],
+        *,
+        source_range: tuple[int, int] | None = None,
+    ) -> int | None:
+        """Return the OOXML character mapped to the nearest rendered glyph."""
+
+        mapping = getattr(self, "_source_character_map", None)
+        if not mapping:
+            return None
+        try:
+            text = self._page.get_text()
+            has_layout, rectangles = self._page.get_text_layout()
+        except (AttributeError, TypeError, ValueError):
+            return None
+        if not has_layout or len(text) != len(rectangles):
+            return None
+        eligible_indices = {
+            index
+            for index, source_index in mapping.items()
+            if source_range is None
+            or source_range[0] <= source_index < source_range[1]
+        }
+        index = self._nearest_glyph_index(
+            text,
+            rectangles,
+            point,
+            flow_map=getattr(self, "_selection_flow_map", {}),
+            flow="main",
+            eligible_indices=eligible_indices,
+        )
+        return mapping.get(index) if index is not None else None
+
+    def configure_table_layout(self, source: _DocxRichTextSource) -> None:
+        """Build cell hit regions and a geometry-backed glyph classification."""
+
+        try:
+            text = self._page.get_text()
+            has_layout, rectangles = self._page.get_text_layout()
+        except (AttributeError, TypeError, ValueError):
+            self._table_cell_layouts = ()
+            self._table_fragment_map = {}
+            self._set_table_copy_hover(None)
+            return
+        if not has_layout or len(text) != len(rectangles):
+            self._table_cell_layouts = ()
+            self._table_fragment_map = {}
+            self._set_table_copy_hover(None)
+            return
+        self._table_cell_layouts = _table_cell_layouts(
+            source,
+            getattr(self, "_source_character_map", {}),
+            text,
+            rectangles,
+        )
+        fragment_map: dict[int, _DocxSelectionFragment] = {}
+        for index, (character, rectangle) in enumerate(
+            zip(text, rectangles, strict=True)
+        ):
+            if character in "\r\n":
+                continue
+            point = (
+                (float(rectangle.x1) + float(rectangle.x2)) / 2,
+                (float(rectangle.y1) + float(rectangle.y2)) / 2,
+            )
+            candidates = [
+                layout for layout in self._table_cell_layouts if layout.contains(point)
+            ]
+            if candidates:
+                chosen = min(
+                    candidates,
+                    key=lambda layout: (
+                        (layout.right - layout.left)
+                        * (layout.bottom - layout.top)
+                    ),
+                )
+                fragment_map[index] = chosen.fragment
+        self._table_fragment_map = fragment_map
+        if self._table_copy_hover_index not in {
+            layout.fragment.table_index for layout in self._table_cell_layouts
+        }:
+            self._set_table_copy_hover(None)
+
+    def table_fragment_at(
+        self,
+        point: tuple[float, float],
+    ) -> _DocxSelectionFragment | None:
+        """Return the source cell whose inferred PDF region contains a point."""
+
+        candidates = [
+            layout
+            for layout in getattr(self, "_table_cell_layouts", ())
+            if layout.contains(point)
+        ]
+        if not candidates:
+            return None
+        return min(
+            candidates,
+            key=lambda layout: (
+                (layout.right - layout.left) * (layout.bottom - layout.top)
+            ),
+        ).fragment
+
+    def _table_copy_button(self, table_index: int) -> _TableCopyButton | None:
+        """Return the fixed-size copy control beside this page's table segment."""
+
+        layouts = [
+            layout
+            for layout in getattr(self, "_table_cell_layouts", ())
+            if layout.fragment.table_index == table_index
+        ]
+        if not layouts:
+            return None
+        table_left = min(layout.left for layout in layouts) * self._zoom
+        table_top = min(layout.top for layout in layouts) * self._zoom
+        table_right = max(layout.right for layout in layouts) * self._zoom
+        page_width = getattr(self, "_width", table_right / self._zoom) * self._zoom
+        margin = TABLE_COPY_BUTTON_PAGE_MARGIN
+        size = TABLE_COPY_BUTTON_SIZE
+        gap = TABLE_COPY_BUTTON_GAP
+
+        # Prefer the conventional table-handle position diagonally outside
+        # the top-left corner.  Side/above fallbacks keep the control wholly
+        # outside the table when a source table is unusually close to one
+        # page edge; never clamp it back on top of the table itself.
+        candidates = (
+            (table_left - gap - size, table_top - gap - size),
+            (table_left - gap - size, table_top),
+            (table_left, table_top - gap - size),
+        )
+        for left, top in candidates:
+            right = left + size
+            bottom = top + size
+            if (
+                left >= margin
+                and top >= margin
+                and right <= page_width - margin
+                and (
+                    right <= table_left - gap
+                    or bottom <= table_top - gap
+                )
+            ):
+                return _TableCopyButton(
+                    table_index=table_index,
+                    left=left,
+                    top=top,
+                    right=right,
+                    bottom=bottom,
+                )
+        return None
+
+    def table_copy_button_at(
+        self, point: tuple[float, float]
+    ) -> _TableCopyButton | None:
+        """Return the currently visible table-copy control at a widget point."""
+
+        table_index = getattr(self, "_table_copy_hover_index", None)
+        if table_index is None:
+            return None
+        button = self._table_copy_button(table_index)
+        return button if button is not None and button.contains(point) else None
+
+    def _set_table_copy_hover(
+        self, table_index: int | None, *, button_hot: bool = False
+    ) -> None:
+        if (
+            getattr(self, "_table_copy_hover_index", None) == table_index
+            and getattr(self, "_table_copy_button_hot", False) == button_hot
+        ):
+            return
+        self._table_copy_hover_index = table_index
+        self._table_copy_button_hot = button_hot
+        self.queue_draw()
+
+    def _update_table_copy_hover(self, point: tuple[float, float]) -> bool:
+        """Track a table or its adjacent copy button under the pointer."""
+
+        button = self.table_copy_button_at(point)
+        if button is not None:
+            self._set_table_copy_hover(button.table_index, button_hot=True)
+            return True
+        zoom = getattr(self, "_zoom", 1.0)
+        fragment = self.table_fragment_at((point[0] / zoom, point[1] / zoom))
+        table_index = fragment.table_index if fragment is not None else None
+        current = getattr(self, "_table_copy_hover_index", None)
+        if table_index is None and current is not None:
+            layouts = [
+                layout
+                for layout in getattr(self, "_table_cell_layouts", ())
+                if layout.fragment.table_index == current
+            ]
+            current_button = self._table_copy_button(current)
+            if layouts and current_button is not None:
+                left = min(
+                    current_button.left,
+                    min(layout.left for layout in layouts) * zoom,
+                )
+                top = min(
+                    current_button.top,
+                    min(layout.top for layout in layouts) * zoom,
+                )
+                right = max(
+                    current_button.right,
+                    max(layout.right for layout in layouts) * zoom,
+                )
+                bottom = max(
+                    current_button.bottom,
+                    max(layout.bottom for layout in layouts) * zoom,
+                )
+                if left <= point[0] <= right and top <= point[1] <= bottom:
+                    table_index = current
+        self._set_table_copy_hover(table_index)
+        return False
+
+    def _copy_selection(
+        self, text: str, html: str | None = None, odt: bytes | None = None
+    ) -> None:
         """Publish a selection for both Ctrl+V and primary paste.
 
         HTML is offered alongside text/plain so Writer receives formatted
@@ -2601,7 +3690,7 @@ class PdfPage(Gtk.DrawingArea):
         for atom in (Gdk.SELECTION_CLIPBOARD, Gdk.SELECTION_PRIMARY):
             clipboard = Gtk.Clipboard.get(atom)
             if html and _publish_rich_clipboard(
-                clipboard, RichTextClipboardPayload(text, html)
+                clipboard, RichTextClipboardPayload(text, html, odt)
             ):
                 continue
             clipboard.set_text(text, -1)
@@ -2613,6 +3702,7 @@ class PdfPage(Gtk.DrawingArea):
         start: tuple[float, float] | None = None,
         end: tuple[float, float] | None = None,
         flow: str | None = None,
+        source_ranges: tuple[tuple[int, int], ...] = (),
     ) -> None:
         """Render one document-coordinated selection segment on this page."""
 
@@ -2620,6 +3710,7 @@ class PdfPage(Gtk.DrawingArea):
         self._text_selection_start = start
         self._text_selection_end = end
         self._text_selection_flow = flow
+        self._text_selection_source_ranges = source_ranges
         self.queue_draw()
 
     def clear_text_selection(self) -> None:
@@ -2631,6 +3722,7 @@ class PdfPage(Gtk.DrawingArea):
         self._text_selection_start = None
         self._text_selection_end = None
         self._text_selection_flow = None
+        self._text_selection_source_ranges = ()
         self.queue_draw()
 
     def selection_flow_at(self, point: tuple[float, float]) -> str:
@@ -2678,6 +3770,18 @@ class PdfPage(Gtk.DrawingArea):
             )
         page_window.set_cursor(self._text_cursor)
 
+    def _set_copy_cursor(self) -> None:
+        """Advertise the actionable whole-table copy affordance."""
+
+        page_window = self.get_window()
+        if page_window is None:
+            return
+        if self._copy_cursor is None:
+            self._copy_cursor = Gdk.Cursor.new_for_display(
+                page_window.get_display(), Gdk.CursorType.HAND2
+            )
+        page_window.set_cursor(self._copy_cursor)
+
     def _on_pointer_enter(
         self, _widget: Gtk.DrawingArea, _event: Gdk.EventCrossing
     ) -> bool:
@@ -2687,6 +3791,8 @@ class PdfPage(Gtk.DrawingArea):
     def _on_pointer_leave(
         self, _widget: Gtk.DrawingArea, _event: Gdk.EventCrossing
     ) -> bool:
+        if not getattr(self, "_table_copy_pressed", False):
+            self._set_table_copy_hover(None)
         page_window = self.get_window()
         if page_window is not None:
             page_window.set_cursor(None)
@@ -2698,8 +3804,23 @@ class PdfPage(Gtk.DrawingArea):
         if event.button != 1:
             return False
         handler = getattr(self, "_selection_handler", None)
+        button = self.table_copy_button_at(self._raw_page_point(event))
+        if button is not None:
+            self._table_copy_pressed = True
+            self._selection_button_pressed = False
+            if handler is not None:
+                handler("table", self, self._raw_page_point(event))
+            return True
+        self._table_copy_pressed = False
+        self._selection_button_pressed = True
+        self._set_table_copy_hover(None)
         if handler is not None:
-            handler("begin", self, self._raw_page_point(event))
+            phase = (
+                "cell"
+                if event.type == Gdk.EventType._2BUTTON_PRESS
+                else "begin"
+            )
+            handler(phase, self, self._raw_page_point(event))
             return True
         self._selection_anchor = self._page_point(event)
         self._text_selection = None
@@ -2707,7 +3828,18 @@ class PdfPage(Gtk.DrawingArea):
         return True
 
     def _on_motion(self, _widget: Gtk.DrawingArea, event: Gdk.EventMotion) -> bool:
-        self._set_text_cursor()
+        if getattr(self, "_table_copy_pressed", False):
+            self._set_copy_cursor()
+            return True
+        button_hot = False
+        if not getattr(self, "_selection_button_pressed", False):
+            button_hot = self._update_table_copy_hover(
+                self._raw_page_point(event)
+            )
+        if button_hot:
+            self._set_copy_cursor()
+        else:
+            self._set_text_cursor()
         handler = getattr(self, "_selection_handler", None)
         if handler is not None:
             handler("update", self, self._raw_page_point(event))
@@ -2723,6 +3855,16 @@ class PdfPage(Gtk.DrawingArea):
     def _on_button_release(
         self, _widget: Gtk.DrawingArea, event: Gdk.EventButton
     ) -> bool:
+        if event.button == 1 and self._table_copy_pressed:
+            self._table_copy_pressed = False
+            button_hot = self._update_table_copy_hover(
+                self._raw_page_point(event)
+            )
+            if button_hot:
+                self._set_copy_cursor()
+            return True
+        if event.button == 1:
+            self._selection_button_pressed = False
         handler = getattr(self, "_selection_handler", None)
         if handler is not None:
             if event.button != 1:
@@ -2876,6 +4018,50 @@ class PdfPage(Gtk.DrawingArea):
                 )
         context.fill()
 
+    def _draw_table_copy_button(self, context: object) -> None:
+        """Paint a compact copy symbol beside the hovered table segment."""
+
+        table_index = self._table_copy_hover_index
+        if table_index is None:
+            return
+        button = self._table_copy_button(table_index)
+        if button is None:
+            return
+        palette = _theme_palette(self)
+        accent = _rgb(palette["selected_background"])
+        foreground = _rgb(palette["selected_foreground"])
+        width = button.right - button.left
+        height = button.bottom - button.top
+        context.save()
+        context.set_source_rgba(0.0, 0.0, 0.0, 0.18)
+        context.arc(
+            button.left + width / 2 + 1.0,
+            button.top + height / 2 + 1.5,
+            width / 2,
+            0,
+            2 * math.pi,
+        )
+        context.fill()
+        context.set_source_rgba(
+            *accent, 1.0 if self._table_copy_button_hot else 0.88
+        )
+        context.arc(
+            button.left + width / 2,
+            button.top + height / 2,
+            width / 2,
+            0,
+            2 * math.pi,
+        )
+        context.fill()
+        context.set_source_rgba(*foreground, 0.98)
+        context.set_line_width(1.6)
+        # Two offset paper outlines form the conventional copy symbol.
+        context.rectangle(button.left + 7.0, button.top + 6.0, 9.0, 11.0)
+        context.stroke()
+        context.rectangle(button.left + 10.0, button.top + 9.0, 9.0, 11.0)
+        context.stroke()
+        context.restore()
+
     def _on_draw(self, _widget: Gtk.DrawingArea, context: object) -> bool:
         # Poppler receives the Pycairo context supplied by GTK.
         # DrawingArea CSS is not guaranteed to supply an opaque surface, so
@@ -2890,6 +4076,7 @@ class PdfPage(Gtk.DrawingArea):
         self._draw_search_highlight(context)
         self._draw_comment_marks(context)
         self._draw_text_selection(context)
+        self._draw_table_copy_button(context)
         return False
 
 
@@ -2899,6 +4086,7 @@ class PdfDocumentView:
     def __init__(
         self,
         on_page_changed: Callable[[int | None, int], None] | None = None,
+        on_table_copied: Callable[[], None] | None = None,
     ) -> None:
         self.widget = Gtk.ScrolledWindow()
         # Keep GTK's vertical adjustment active for wheel, touchpad, keyboard,
@@ -2945,6 +4133,7 @@ class PdfDocumentView:
         self._pending_restore: DocumentPosition | None = None
         self._restore_attempts = 0
         self._on_page_changed = on_page_changed
+        self._on_table_copied = on_table_copied
         self.zoom = DEFAULT_ZOOM
         adjustment = self.widget.get_vadjustment()
         self._selection_scroll_value = adjustment.get_value()
@@ -3112,6 +4301,41 @@ class PdfDocumentView:
         """Coordinate one pointer drag across the complete PDF document."""
 
         document_point = self._document_point_for_page(page, point)
+        if phase == "table":
+            button = page.table_copy_button_at(point)
+            source = self._rich_source
+            if button is None or source is None:
+                return
+            self._clear_document_selection()
+            self._selection_anchor = document_point
+            self._selection_endpoint = document_point
+            self._selection_anchor_page = page
+            self._selection_anchor_flow = "main"
+            selection = source.table_selection_for_table(button.table_index)
+            if selection is not None:
+                self._apply_table_selection(selection)
+                self._clear_document_selection()
+                if self._on_table_copied is not None:
+                    self._on_table_copied()
+            return
+        if phase == "cell":
+            self._clear_document_selection()
+            self._selection_anchor = document_point
+            self._selection_endpoint = document_point
+            self._selection_anchor_page = page
+            page_point = self._page_point_for_document(page, document_point)
+            self._selection_anchor_flow = page.selection_flow_at(page_point)
+            source = self._rich_source
+            fragment = page.table_fragment_at(page_point)
+            if (
+                source is not None
+                and fragment is not None
+                and self._selection_anchor_flow == "main"
+            ):
+                selection = source.table_selection_between(fragment, fragment)
+                if selection is not None:
+                    self._apply_table_selection(selection)
+            return
         if phase == "begin":
             self._clear_document_selection()
             self._selection_anchor = document_point
@@ -3268,24 +4492,20 @@ class PdfDocumentView:
                 # Folding it to whitespace keeps wrapped paragraphs aligned.
                 cursor += 1
         rendered_text = "\n".join(page_text)
-        rendered, rendered_indices = _fold_selection_whitespace(rendered_text)
-        source_text, source_indices = _fold_selection_whitespace(source._selection_text)
-        if rendered and source_text:
-            matcher = SequenceMatcher(None, rendered, source_text)
-            for match in matcher.get_matching_blocks():
-                for delta in range(match.size):
-                    rendered_index = rendered_indices[match.a + delta]
-                    page_index = 0
-                    while (
-                        page_index + 1 < len(offsets)
-                        and rendered_index >= offsets[page_index + 1]
-                    ):
-                        page_index += 1
-                    local_index = rendered_index - offsets[page_index]
-                    if 0 <= local_index < len(page_text[page_index]):
-                        self._pages[page_index]._source_character_map[local_index] = (
-                            source_indices[match.b + delta]
-                        )
+        for rendered_index, source_index in _source_character_matches(
+            rendered_text, source._selection_text
+        ).items():
+            page_index = 0
+            while (
+                page_index + 1 < len(offsets)
+                and rendered_index >= offsets[page_index + 1]
+            ):
+                page_index += 1
+            local_index = rendered_index - offsets[page_index]
+            if 0 <= local_index < len(page_text[page_index]):
+                self._pages[page_index]._source_character_map[local_index] = (
+                    source_index
+                )
 
         flow_texts = getattr(source, "_selection_flow_texts", {})
         for page, text in zip(self._pages, page_text, strict=True):
@@ -3301,6 +4521,7 @@ class PdfDocumentView:
                 page._height,
                 flow_texts,
             )
+            page.configure_table_layout(source)
 
     def _map_comments_to_pages(self) -> None:
         """Map OOXML comment ranges onto the PDF glyph rectangles they cover."""
@@ -3395,8 +4616,91 @@ class PdfDocumentView:
         for page_index, page in enumerate(self._pages):
             page.set_comment_marks(marks_by_page[page_index])
 
+    def _active_table_selection(self) -> _DocxTableSelection | None:
+        """Resolve the drag endpoints to source table cells when possible."""
+
+        source = getattr(self, "_rich_source", None)
+        anchor = self._selection_anchor
+        endpoint = self._selection_endpoint
+        if (
+            source is None
+            or anchor is None
+            or endpoint is None
+            or getattr(self, "_selection_anchor_flow", "main") != "main"
+            or anchor == endpoint
+        ):
+            return None
+        anchor_page_index = self._selection_page_index(anchor)
+        endpoint_page_index = self._selection_page_index(endpoint)
+        if anchor_page_index is None or endpoint_page_index is None:
+            return None
+        anchor_page = self._pages[anchor_page_index]
+        endpoint_page = self._pages[endpoint_page_index]
+        anchor_point = self._page_point_for_document(anchor_page, anchor)
+        endpoint_point = self._page_point_for_document(endpoint_page, endpoint)
+        anchor_fragment = anchor_page.table_fragment_at(anchor_point)
+        endpoint_fragment = endpoint_page.table_fragment_at(endpoint_point)
+        if anchor_fragment is not None and endpoint_fragment is not None:
+            if anchor_fragment == endpoint_fragment:
+                source_range = (anchor_fragment.start, anchor_fragment.end)
+                anchor_source = anchor_page.source_index_at(
+                    anchor_point, source_range=source_range
+                )
+                endpoint_source = endpoint_page.source_index_at(
+                    endpoint_point, source_range=source_range
+                )
+                if anchor_source is not None and endpoint_source is not None:
+                    return source.cell_text_selection(
+                        anchor_fragment, anchor_source, endpoint_source
+                    )
+                return source.table_selection_between(
+                    anchor_fragment, endpoint_fragment
+                )
+            return source.table_selection_between(
+                anchor_fragment, endpoint_fragment
+            )
+        anchor_source = anchor_page.source_index_at(anchor_point)
+        endpoint_source = endpoint_page.source_index_at(endpoint_point)
+        if anchor_source is None or endpoint_source is None:
+            return None
+        return source.table_selection(anchor_source, endpoint_source)
+
+    def _apply_table_selection(self, selection: _DocxTableSelection) -> None:
+        """Highlight only selected cells and publish their tabular payload."""
+
+        ranges = selection.source_ranges
+        complete_ranges = set(ranges)
+        for page in self._pages:
+            mapping = getattr(page, "_source_character_map", {})
+            has_selected_source_glyph = any(
+                any(start <= source_index < end for start, end in ranges)
+                for source_index in mapping.values()
+            )
+            has_selected_geometry_glyph = any(
+                (fragment.start, fragment.end) in complete_ranges
+                for fragment in getattr(page, "_table_fragment_map", {}).values()
+            )
+            if not has_selected_source_glyph and not has_selected_geometry_glyph:
+                page.clear_text_selection()
+                continue
+            page.set_text_selection(
+                TextSelection(0.0, 0.0, page._width, page._height),
+                flow="main",
+                source_ranges=ranges,
+            )
+        if self._selection_anchor_page is not None:
+            payload = selection.payload
+            self._selection_anchor_page._copy_selection(
+                payload.text, payload.html, payload.odt
+            )
+
     def _apply_document_selection(self) -> None:
         """Render and copy every page segment covered by the active drag."""
+
+        table_selection = self._active_table_selection()
+        if table_selection is not None:
+            self._apply_table_selection(table_selection)
+            return
 
         regions = self._selection_regions()
         selected_page_ids = {
@@ -3563,17 +4867,59 @@ class PdfDocumentView:
         )
         return self.set_zoom(min(self.zoom, target), minimum=MIN_FIT_ZOOM)
 
+    def _width_fit_zoom(self) -> float | None:
+        """Return the zoom for the width currently allocated to the PDF pane."""
+
+        if not self._pages or self._pages[0]._width <= 0:
+            return None
+        return max(
+            MIN_FIT_ZOOM,
+            (self.widget.get_allocated_width() - 2 * PAGE_MARGIN)
+            / self._pages[0]._width,
+        )
+
+    def _height_fit_zoom(self) -> float | None:
+        """Return the zoom that fits one complete page into the PDF pane height."""
+
+        if not self._pages or self._pages[0]._height <= 0:
+            return None
+        return max(
+            MIN_FIT_ZOOM,
+            (self.widget.get_allocated_height() - 2 * PAGE_MARGIN)
+            / self._pages[0]._height,
+        )
+
     def fit_to_width(self) -> bool:
         """Zoom out enough to keep the page width visible while scrolling vertically."""
 
-        if not self._pages:
+        target = self._width_fit_zoom()
+        if target is None:
             return False
-        viewport_width = self.widget.get_allocated_width()
-        target = max(
-            MIN_FIT_ZOOM,
-            (viewport_width - 2 * PAGE_MARGIN) / self._pages[0]._width,
-        )
         return self.set_zoom(min(self.zoom, target), minimum=MIN_FIT_ZOOM)
+
+    def zoom_to_width(self) -> bool:
+        """Make the page fill the current PDF pane, zooming in or out as needed."""
+
+        target = self._width_fit_zoom()
+        if target is None:
+            return False
+        return self.set_zoom(
+            target,
+            minimum=MIN_FIT_ZOOM,
+            maximum=None,
+        )
+
+    def zoom_to_height(self) -> bool:
+        """Fit one complete page vertically, zooming in or out as needed."""
+
+        target = self._height_fit_zoom()
+        if target is None:
+            return False
+        return self.set_zoom(
+            target,
+            minimum=MIN_FIT_ZOOM,
+            maximum=None,
+        )
 
     def _page_geometries(self) -> list[PageGeometry]:
         geometries: list[PageGeometry] = []
@@ -3927,7 +5273,10 @@ class DocxWindow(Gtk.ApplicationWindow):
         # height between start- and end-packed children in this overlay layout.
         root = Gtk.Grid()
         _style(root, "see-docx-root")
-        self.document = PdfDocumentView(self._update_pagination_controls)
+        self.document = PdfDocumentView(
+            self._update_pagination_controls,
+            self._on_table_copied,
+        )
         workspace = Gtk.Overlay()
         workspace.set_hexpand(True)
         workspace.set_vexpand(True)
@@ -3996,6 +5345,11 @@ class DocxWindow(Gtk.ApplicationWindow):
         self._document_layout.attach(self._comments_revealer, 2, 0, 1, 1)
         workspace.add(self._document_layout)
         self._comment_line_layer = Gtk.DrawingArea()
+        # This is a paint-only canvas. A native GdkWindow here can become the
+        # compositor's pointer target across the whole workspace even when
+        # GtkOverlay reports the child as pass-through, starving the PDF pages
+        # of cursor, drag-selection, and wheel events.
+        self._comment_line_layer.set_has_window(False)
         self._comment_line_layer.set_halign(Gtk.Align.FILL)
         self._comment_line_layer.set_valign(Gtk.Align.FILL)
         self._comment_line_layer.set_hexpand(True)
@@ -4839,7 +6193,7 @@ class DocxWindow(Gtk.ApplicationWindow):
         return GLib.SOURCE_REMOVE
 
     def _apply_comment_sizing(self) -> None:
-        """Apply the active width instantly, growing only toward the left."""
+        """Refresh stable rail cards and promote the active one when possible."""
 
         should_float = (
             self._comments_focused
@@ -4852,16 +6206,6 @@ class DocxWindow(Gtk.ApplicationWindow):
         )
         if not should_float:
             self._restore_active_comment_card()
-        for thread in self._comment_annotations:
-            card = self._comment_cards.get(thread.thread_id)
-            if card is None:
-                continue
-            active = (
-                self._comments_focused
-                and thread.thread_id == self._active_comment_id
-            )
-            card.set_margin_start(0 if active else COMMENT_INACTIVE_CARD_INSET)
-            card.set_margin_end(0)
         self._layout_comments()
         if should_float:
             # Let GTK commit the active card's rail allocation first. The
@@ -6472,6 +7816,14 @@ class DocxWindow(Gtk.ApplicationWindow):
         Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(str(self.path), -1)
         self._show_notification("Path copied", _compact_path(self.path))
 
+    def _on_table_copied(self) -> None:
+        """Confirm a successful whole-table control activation."""
+
+        self._show_notification(
+            "Table copied",
+            "The complete table is ready to paste",
+        )
+
     def _copy_all_text(self) -> None:
         """Copy the full document while preserving its original paragraphs."""
 
@@ -6835,6 +8187,10 @@ class DocxWindow(Gtk.ApplicationWindow):
             self._set_zoom(-ZOOM_STEP)
         elif event.keyval == Gdk.KEY_0:
             self._reset_zoom()
+        elif event.keyval == Gdk.KEY_Z:
+            self.document.zoom_to_height()
+        elif event.keyval == Gdk.KEY_z:
+            self.document.zoom_to_width()
         elif event.keyval == Gdk.KEY_r:
             self._queue_refresh(delay=0)
         elif event.keyval == Gdk.KEY_q:

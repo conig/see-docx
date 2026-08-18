@@ -4,18 +4,114 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 import unittest
 
-from see_docx.viewer import DocxWindow, Gdk, MAX_ZOOM, PdfDocumentView, ZOOM_STEP
+from see_docx.viewer import (
+    DocxWindow,
+    Gdk,
+    MAX_ZOOM,
+    MIN_FIT_ZOOM,
+    PAGE_MARGIN,
+    PdfDocumentView,
+    ZOOM_STEP,
+)
 
 
 class _Page:
-    def __init__(self) -> None:
+    def __init__(self, width: float = 0.0, height: float = 0.0) -> None:
+        self._width = width
+        self._height = height
         self.zooms: list[float] = []
 
     def set_zoom(self, zoom: float) -> None:
         self.zooms.append(zoom)
 
 
+class _HiddenPanel:
+    def get_visible(self) -> bool:
+        return False
+
+
+class _Entry:
+    def is_focus(self) -> bool:
+        return False
+
+
+class _WidthFitKeyWindow:
+    _on_key_press = DocxWindow._on_key_press
+
+    def __init__(self) -> None:
+        self._search_panel = _HiddenPanel()
+        self._page_jump_panel = _HiddenPanel()
+        self._export_panel = _HiddenPanel()
+        self._outline_panel = _HiddenPanel()
+        self._search_entry = _Entry()
+        self._page_jump_entry = _Entry()
+        self._url_hint_targets: dict[str, str] = {}
+        self._pending_g = False
+        self.document = SimpleNamespace(
+            zoom_to_width=Mock(return_value=True),
+            zoom_to_height=Mock(return_value=True),
+        )
+
+
 class ZoomTests(unittest.TestCase):
+    def test_z_fits_the_page_to_the_current_central_pane_width(self) -> None:
+        window = _WidthFitKeyWindow()
+
+        self.assertTrue(
+            window._on_key_press(
+                window,
+                SimpleNamespace(keyval=Gdk.KEY_z, state=0),
+            )
+        )
+
+        window.document.zoom_to_width.assert_called_once_with()
+
+    def test_uppercase_z_fits_the_complete_page_height(self) -> None:
+        window = _WidthFitKeyWindow()
+
+        self.assertTrue(
+            window._on_key_press(
+                window,
+                SimpleNamespace(keyval=Gdk.KEY_Z, state=Gdk.ModifierType.SHIFT_MASK),
+            )
+        )
+
+        window.document.zoom_to_height.assert_called_once_with()
+
+    def test_width_fit_uses_the_current_central_pane_allocation_exactly(self) -> None:
+        view = object.__new__(PdfDocumentView)
+        view._document = object()
+        view._pages = [_Page(width=600.0)]
+        pane = SimpleNamespace(get_allocated_width=Mock(return_value=972))
+        view.widget = pane
+        view.set_zoom = Mock(return_value=True)
+
+        self.assertTrue(view.zoom_to_width())
+        view.set_zoom.assert_called_once_with(
+            (972 - 2 * PAGE_MARGIN) / 600.0,
+            minimum=MIN_FIT_ZOOM,
+            maximum=None,
+        )
+
+        pane.get_allocated_width.return_value = 672
+        view.zoom_to_width()
+        self.assertAlmostEqual(view.set_zoom.call_args.args[0], 1.0)
+
+    def test_height_fit_uses_the_current_document_viewport_exactly(self) -> None:
+        view = object.__new__(PdfDocumentView)
+        view._document = object()
+        view._pages = [_Page(width=600.0, height=800.0)]
+        pane = SimpleNamespace(get_allocated_height=Mock(return_value=872))
+        view.widget = pane
+        view.set_zoom = Mock(return_value=True)
+
+        self.assertTrue(view.zoom_to_height())
+        view.set_zoom.assert_called_once_with(
+            (872 - 2 * PAGE_MARGIN) / 800.0,
+            minimum=MIN_FIT_ZOOM,
+            maximum=None,
+        )
+
     def test_window_resize_scales_current_zoom_in_both_directions(self) -> None:
         """Page and surrounding whitespace must retain their width ratio."""
 

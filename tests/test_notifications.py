@@ -108,6 +108,20 @@ class ActionNotificationTests(unittest.TestCase):
         self.assertEqual(window._notification_source, 0)
         self.assertFalse(window._notification_revealer.revealed)
 
+    def test_whole_table_copy_uses_the_standard_success_notification(self) -> None:
+        window = self._window()
+        window._notification_source = 0
+
+        with patch("see_docx.viewer.GLib.timeout_add", return_value=73):
+            DocxWindow._on_table_copied(window)
+
+        self.assertTrue(window._notification_revealer.revealed)
+        self.assertEqual(window._notification_title.text, "Table copied")
+        self.assertEqual(
+            window._notification_detail.text,
+            "The complete table is ready to paste",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

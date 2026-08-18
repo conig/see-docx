@@ -170,20 +170,32 @@ class CommentSourceTests(unittest.TestCase):
 
 
 class CommentFloatGeometryTests(unittest.TestCase):
-    def test_page_adjacent_bubble_uses_the_gutter_and_caps_width(self) -> None:
+    def test_page_adjacent_bubbles_keep_one_width_across_page_positions(self) -> None:
+        """Mixed page edges must not make focused comments resize the layout."""
+
+        self.assertEqual(
+            viewer._comment_float_geometry(400, 760, 800, 400, 200),
+            (418, 300, 300),
+        )
+        self.assertEqual(
+            viewer._comment_float_geometry(420, 760, 800, 400, 200),
+            (438, 300, 300),
+        )
+
+    def test_page_adjacent_bubble_uses_the_gutter_and_fixed_width(self) -> None:
         self.assertEqual(
             viewer._comment_float_geometry(400, 1000, 800, 400, 200),
-            (418, 300, 320),
+            (418, 300, 300),
         )
 
     def test_page_adjacent_bubble_clamps_to_the_canvas_edges(self) -> None:
         self.assertEqual(
             viewer._comment_float_geometry(400, 1000, 800, 10, 400),
-            (418, 18, 320),
+            (418, 18, 300),
         )
         self.assertEqual(
             viewer._comment_float_geometry(400, 1000, 800, 795, 400),
-            (418, 382, 320),
+            (418, 382, 300),
         )
 
     def test_page_adjacent_bubble_falls_back_when_the_gutter_is_too_narrow(self) -> None:
@@ -194,7 +206,7 @@ class CommentFloatGeometryTests(unittest.TestCase):
     def test_page_adjacent_bubble_can_cross_the_document_rail_seam(self) -> None:
         self.assertEqual(
             viewer._comment_float_geometry(700, 1080, 800, 400, 200),
-            (718, 300, 320),
+            (718, 300, 300),
         )
 
     def test_page_adjacent_bubble_rejects_offscreen_anchors(self) -> None:

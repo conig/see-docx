@@ -49,6 +49,10 @@ see-docx path/to/output.docx
 
 ## Navigation
 
+The complete mode-by-mode keyboard contract is maintained in
+[the specification](SPEC.md#keyboard-interaction). The quick reference below
+covers the primary reading workflow.
+
 | Keys | Action |
 | --- | --- |
 | `j` / `k` | Scroll down / up |
@@ -70,6 +74,8 @@ see-docx path/to/output.docx
 | `f`, then a displayed home-row hint | Open a visible URL with its default desktop application |
 | `:number` | Jump directly to one-based page `number` |
 | `+` / `-` / `0` | Zoom in / out / reset zoom |
+| `z` | Fit the page width to the central pane, accounting for open side panels |
+| `Z` | Fit one complete page vertically in the central pane |
 | `r` | Refresh now |
 | `q` | Close See DOCX |
 
@@ -84,7 +90,7 @@ no visible outline.
 Copying the document path or complete document text shows a compact in-app
 confirmation above the bottom bar. Repeated actions replace and reset the same
 notification, so confirmations stay visible without accumulating over the
-document.
+document. The whole-table hover control uses this confirmation as well.
 It initially expands only as many whole heading levels as will keep the visible
 list below 10 entries; use `l` to reveal deeper structure.
 Its relative `j` / `k` offsets use a fixed gutter, like Neovim relative line
@@ -149,11 +155,35 @@ Pointer text selections continue across page breaks through the main document
 text and copy all intersected body text as one clipboard value, without passing
 through repeated headers or footers. A selection that begins in a header or
 footer remains confined to that region on its starting page. The DOCX source
-restores formatting and table structure for Writer-compatible HTML paste,
-while plain text remains available for other applications; a selected table
-cell is copied as a cell rather than its visual PDF row. Keep holding the mouse
-button to use the wheel, or drag above or below a page to auto-scroll while
-extending the selection.
+restores formatting and table structure for Writer-compatible paste, while
+plain text remains available for other applications.
+
+Table selection has an explicit cell-aware contract:
+
+- A drag wholly inside one cell selects only that text range and copies it as
+  one one-cell table; it never leaks through neighbouring cells in PDF reading
+  order.
+- A double-click inside a cell selects only that cell's complete contents,
+  without extending into the header or body row above or below it.
+- Hovering a table reveals a copy symbol at its top-left. Clicking the symbol
+  copies the entire table as one structured table object, confirms success at
+  the bottom of the window, and clears the temporary selection.
+- Once a drag crosses a cell boundary, the endpoints define a rectangular cell
+  grid. A horizontal drag copies one row, and an upward or downward vertical
+  drag copies only that column.
+- Every such selection is one coherent table object on the rich clipboard, not
+  a sequence of unrelated one-cell tables. Pasting into a blank Writer document
+  therefore creates one table and retains the selected row/column shape.
+
+LibreOffice Writer 25.8 does not perform one-for-one replacement when an entire
+destination row or column is selected: even a row copied natively from one
+Writer process is appended in full to every selected destination cell. See DOCX
+does not claim to override that receiver-side paste behaviour. Its contract is
+that the clipboard contains one correctly shaped table (plus TSV plain text),
+rather than the unrelated per-cell tables that caused the original distortion.
+
+Keep holding the mouse button to use the wheel, or drag above or below a page
+to auto-scroll while extending the selection.
 Press `e` to open the export tool. Choose PDF, plain text, or Markdown with
 `j` / `k` and `Enter`, then select a destination in the save dialog. PDF uses
 an isolated LibreOffice profile; the text formats are exported by Pandoc.
@@ -198,10 +228,31 @@ make uninstall
 
 ## Develop and verify
 
-Run the unit tests and static compilation check:
+Run the complete test battery, including the static compilation check, unit
+tests, and real GTK pointer/selection/scrolling smoke tests:
 
 ```bash
-make check
+make test-battery
+```
+
+`scripts/run-headless-gui-test` creates a disposable 1920x1080 Sway headless
+compositor, focuses its workspace 15, then runs any command passed to it. By
+default it also blocks access to the user's D-Bus session so portals and
+application discovery cannot escape to the live desktop; pass `--session-bus`
+when a future test genuinely needs a private session bus. The smoke tests use
+Sway's virtual-pointer protocol for real pointer motion, drag, button, and wheel
+events, and `wtype` for real keyboard events. On failure the runner uses `grim`
+to leave a screenshot, Sway tree, workspace state, config, and log in a
+reported directory under `/tmp`.
+
+The graphical kit requires Sway, Grim, wtype, jq, GCC, `wayland-scanner`, the
+Wayland client development files, Pandoc, and LibreOffice. It neither maps a
+window on the user's compositor nor changes the user's workspace or cursor.
+Use `make check` when only the display-independent automated suite is available.
+Any additional graphical command can be isolated in the same way:
+
+```bash
+scripts/run-headless-gui-test env PYTHONPATH=src python3 tests/my_gui_test.py
 ```
 
 The tests cover the position-restoration policy, including unchanged
@@ -221,16 +272,40 @@ It scrolls the preview, updates a private copy of the supplied DOCX, and
 asserts that the page and within-page offset survive the real conversion and
 file-monitor refresh.
 
-Run the focused-comment smoke test to exercise the realized GTK overlay:
+Run the focused-comment smoke test by itself to exercise the realized GTK
+overlay and real document input path:
 
 ```bash
 make comments-smoke
 ```
 
-It creates a temporary commented DOCX, focuses its comment rail, and verifies
+It creates a temporary commented DOCX, focuses its comment rail through
+`wtype`, and verifies
 that the selected thread leaves an exact-size ghost in the rail while a mapped,
-interactive copy appears beside the page. It then closes comment focus and
-checks that the still-allocated empty layer passes document input through.
+interactive copy appears beside the page. With a real compositor pointer it
+then checks the PDF text cursor, drag selection, and wheel scrolling before
+closing comment focus and confirming that the still-allocated empty layer
+passes document input through.
+
+Run the table-selection integration smoke by itself with:
+
+```bash
+make rich-selection-smoke
+```
+
+It uses real intra-cell, double-click, horizontal, and upward vertical pointer
+gestures; checks the plain-text, HTML, and embedded ODF clipboard shapes; then
+asks a disposable Writer instance to consume See DOCX's live clipboard in a
+blank document as one correctly shaped table. A second long-document fixture
+includes repeated running XML before the table so the same gestures cannot
+silently fall back to PDF row-major selection. A third open, asymmetric table
+forces Poppler's column-major reading order and verifies independently that the
+visible final-column highlight cannot enter its wider neighbour or disappear
+when a complete geometry-identified cell has no linear source-text matches.
+The battery also hovers and clicks the painted whole-table copy control with
+real compositor input, including from a later segment of a table spanning
+multiple rendered pages, and verifies one complete structured clipboard table
+plus cleared selection state on every occupied page after the copy succeeds.
 
 ## Limit of position preservation
 
