@@ -45,7 +45,7 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     path = arguments.path.expanduser()
-    if path.suffix.lower() != ".docx":
+    if not path.name.casefold().endswith(".docx"):
         print("see-docx expects a .docx file.", file=sys.stderr)
         return 2
     application = DocxApplication(path)
